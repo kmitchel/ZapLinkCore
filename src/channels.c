@@ -51,8 +51,8 @@ int load_channels(const char *filename) {
             char *key = strtok(trimmed, "=");
             char *val = strtok(NULL, "=");
             if (key && val) {
-                // Trim key and val
-                // Simple trim implementation inline or assume format is clean enough
+                trim(key);
+                trim(val);
                 if (strcmp(key, "SERVICE_ID") == 0) strcpy(current->service_id, val);
                 else if (strcmp(key, "FREQUENCY") == 0) strcpy(current->frequency, val);
                 else if (strcmp(key, "VCHANNEL") == 0) strcpy(current->number, val);
