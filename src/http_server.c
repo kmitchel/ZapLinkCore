@@ -108,6 +108,8 @@ void handle_stream(int sockfd, const char *channel) {
         
         char adapter_id[8];
         snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
+        
+        fprintf(stderr, "Executing: dvbv5-zap -c %s -r -a %s -o - \"%s\"\n", CHANNELS_CONF, adapter_id, c->name);
 
         execlp("dvbv5-zap", "dvbv5-zap", "-c", CHANNELS_CONF, "-r", "-a", adapter_id, "-o", "-", c->name, NULL);
         perror("exec zap failed");
