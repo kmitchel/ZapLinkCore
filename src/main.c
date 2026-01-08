@@ -7,6 +7,7 @@
 #include "db.h"
 #include "tuner.h"
 #include "http_server.h"
+#include "epg.h"
 
 int main() {
     // Ignore SIGPIPE to prevent crash on client disconnect
@@ -32,7 +33,10 @@ int main() {
     // 3. Discover Tuners
     discover_tuners();
 
-    // 4. Start HTTP Server
+    // 4. Start EPG Thread
+    start_epg_thread();
+
+    // 5. Start HTTP Server
     // This blocks Main thread, so running loop is inside
     start_http_server(DEFAULT_PORT);
 

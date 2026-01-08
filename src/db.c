@@ -15,6 +15,27 @@ int db_init() {
         fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
         return 0;
     }
+    
+    // Create Table if not exists
+    char *sql = "CREATE TABLE IF NOT EXISTS programs ("
+                "frequency TEXT, "
+                "channel_service_id TEXT, "
+                "start_time INTEGER, "
+                "end_time INTEGER, "
+                "title TEXT, "
+                "description TEXT, "
+                "event_id INTEGER, "
+                "source_id INTEGER, "
+                "PRIMARY KEY (frequency, channel_service_id, start_time));";
+    
+    char *err_msg = 0;
+    rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        return 0;
+    }
+    
     return 1;
 }
 
@@ -46,7 +67,6 @@ char *db_get_xmltv_programs() {
     }
 
     // Bind current time (in ms, as JS uses Date.now())
-    // Wait, JS uses Date.now(). Node sqlite3 stores what? Integers likely.
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -55,6 +75,7 @@ char *db_get_xmltv_programs() {
     size_t cap = 1024 * 1024; // 1MB start
     size_t size = 0;
     char *xml = malloc(cap);
+    if (!xml) return NULL;
     xml[0] = '\0';
 
     append_str(&xml, &size, &cap, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv>\n");
@@ -73,24 +94,14 @@ char *db_get_xmltv_programs() {
         long long start = sqlite3_column_int64(stmt, 2);
         long long end = sqlite3_column_int64(stmt, 3);
         const char *svc_id = (const char *)sqlite3_column_text(stmt, 4); 
-        // Note: JS schema says channel_service_id. In C code we should match it to channel number.
-        // This is tricky. JS implementation finds channel by frequency AND service ID.
-        // Optimization: For now, we assume simple mapping logic or just iterate.
-        // To do it properly, we need to look up the channel.
         
-        // Find channel by service ID (svc_id logic might be loose here, simplified for C)
-        // I will assume simple matching for the MVP.
-        
-        char channel_num[32] = "0";
-        for(int k=0; k<channel_count;k++) {
-            if (strcmp(channels[k].service_id, svc_id) == 0) {
-                 strcpy(channel_num, channels[k].number);
-                 break;
-            }
-        }
+        // Find channel Number. In DB we stored 'channel_service_id' which in JS logic could be 'Major.Minor' OR 'ServiceId'.
+        // Wait, in my parse_atsc_EIT, I passed 'chan_num' (Major.Minor) as 'channel_service_id'.
+        // So I can use it directly as channel ID if it matches `channels.conf` VCHANNEL.
+        // JS logic stores `channel_service_id` via `this.sourceMap.get(...)` which maps to channelNum.
+        // So svc_id IS likely "55.1".
 
         // Format dates (YYYYMMDDHHMMSS +0000)
-        // Assuming TS is milliseconds
         time_t start_s = start / 1000;
         time_t end_s = end / 1000;
         struct tm *tm_s = gmtime(&start_s);
@@ -102,9 +113,9 @@ char *db_get_xmltv_programs() {
         strftime(end_str, 20, "%Y%m%d%H%M%S +0000", tm_e);
 
         char buf[1024];
-        // Note: XML escaping is missing here for brevity, should be added for robust solution
+        // TODO: XML Escape
         snprintf(buf, sizeof(buf), "  <programme start=\"%s\" stop=\"%s\" channel=\"%s\">\n    <title>%s</title>\n    <desc>%s</desc>\n  </programme>\n",
-            start_str, end_str, channel_num, title ? title : "", desc ? desc : "");
+            start_str, end_str, svc_id, title ? title : "", desc ? desc : "");
             
         append_str(&xml, &size, &cap, buf);
     }
@@ -113,4 +124,32 @@ char *db_get_xmltv_programs() {
     
     sqlite3_finalize(stmt);
     return xml;
+}
+
+void db_upsert_program(const char *frequency, const char *channel_service_id, long long start_time, long long end_time, const char *title, int event_id, int source_id) {
+    if (!db) return;
+
+    char *sql = "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(frequency, channel_service_id, start_time) "
+                "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, event_id=excluded.event_id, source_id=excluded.source_id";
+    
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Prepare error: %s\n", sqlite3_errmsg(db));
+        return;
+    }
+
+    sqlite3_bind_text(stmt, 1, frequency, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, channel_service_id, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 3, start_time);
+    sqlite3_bind_int64(stmt, 4, end_time);
+    sqlite3_bind_text(stmt, 5, title, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 6, "", -1, SQLITE_STATIC); // Description empty for now
+    sqlite3_bind_int(stmt, 7, event_id);
+    sqlite3_bind_int(stmt, 8, source_id);
+
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
 }
