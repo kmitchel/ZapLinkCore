@@ -270,10 +270,11 @@ void *client_thread(void *arg) {
             char *chan = path + 8;
             handle_stream(sockfd, chan);
         } else if (strncmp(path, "/transcode/", 11) == 0) {
-            // Parse /transcode/{backend}/{codec}/{channel}
+            // Parse /transcode/{backend}/{codec}/{channel}[/6]
             char backend_str[32] = {0};
             char codec_str[32] = {0};
             char chan_str[64] = {0};
+            int surround51 = 0;
             char *p = path + 11;
             char *slash1 = strchr(p, '/');
             if (slash1) {
@@ -281,7 +282,16 @@ void *client_thread(void *arg) {
                 char *slash2 = strchr(slash1 + 1, '/');
                 if (slash2) {
                     strncpy(codec_str, slash1 + 1, slash2 - slash1 - 1);
-                    strncpy(chan_str, slash2 + 1, sizeof(chan_str) - 1);
+                    // Check for optional /6 suffix
+                    char *slash3 = strchr(slash2 + 1, '/');
+                    if (slash3) {
+                        strncpy(chan_str, slash2 + 1, slash3 - slash2 - 1);
+                        if (strcmp(slash3 + 1, "6") == 0) {
+                            surround51 = 1;
+                        }
+                    } else {
+                        strncpy(chan_str, slash2 + 1, sizeof(chan_str) - 1);
+                    }
                 }
             }
             TranscodeBackend backend = parse_backend(backend_str);
@@ -289,7 +299,7 @@ void *client_thread(void *arg) {
             if (backend == BACKEND_INVALID || codec == CODEC_INVALID || chan_str[0] == '\0') {
                 send_response(sockfd, "400 Bad Request", "text/plain", "Invalid transcode parameters");
             } else {
-                handle_transcode(sockfd, backend, codec, chan_str);
+                handle_transcode(sockfd, backend, codec, chan_str, surround51);
             }
         } else if (strncmp(path, "/playlist/", 10) == 0) {
             // Parse /playlist/{backend}/{codec}.m3u

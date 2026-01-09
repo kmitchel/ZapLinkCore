@@ -25,9 +25,9 @@ TranscodeCodec parse_codec(const char *str) {
     return CODEC_INVALID;
 }
 
-// Build FFmpeg argument list based on backend and codec
+// Build FFmpeg argument list based on backend, codec, and audio settings
 // Returns malloc'd argv array (caller frees)
-static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, int *argc_out) {
+static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, int surround51, int *argc_out) {
     // Max 50 args for all options
     char **argv = malloc(sizeof(char*) * 50);
     int argc = 0;
@@ -151,21 +151,44 @@ static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, 
     // Audio encoder and output format depend on codec
     if (codec == CODEC_AV1) {
         // AV1 uses WebM container with Opus audio
-        // Force stereo downmix for Opus (5.1 surround not supported by default)
-        argv[argc++] = "-ac";
-        argv[argc++] = "2";
-        argv[argc++] = "-c:a";
-        argv[argc++] = "libopus";
-        argv[argc++] = "-b:a";
-        argv[argc++] = "128k";
+        if (surround51) {
+            // 5.1 surround: remap 5.1(side) to standard 5.1 layout and use mapping_family 1
+            argv[argc++] = "-af";
+            argv[argc++] = "channelmap=channel_layout=5.1";
+            argv[argc++] = "-c:a";
+            argv[argc++] = "libopus";
+            argv[argc++] = "-mapping_family";
+            argv[argc++] = "1";
+            argv[argc++] = "-b:a";
+            argv[argc++] = "256k";
+        } else {
+            // Stereo downmix (default)
+            argv[argc++] = "-ac";
+            argv[argc++] = "2";
+            argv[argc++] = "-c:a";
+            argv[argc++] = "libopus";
+            argv[argc++] = "-b:a";
+            argv[argc++] = "128k";
+        }
         argv[argc++] = "-f";
         argv[argc++] = "webm";
     } else {
         // H.264/HEVC use MPEG-TS with AAC
-        argv[argc++] = "-c:a";
-        argv[argc++] = "aac";
-        argv[argc++] = "-b:a";
-        argv[argc++] = "128k";
+        if (surround51) {
+            // Keep 5.1 surround
+            argv[argc++] = "-c:a";
+            argv[argc++] = "aac";
+            argv[argc++] = "-b:a";
+            argv[argc++] = "384k";
+        } else {
+            // Stereo downmix (default)
+            argv[argc++] = "-ac";
+            argv[argc++] = "2";
+            argv[argc++] = "-c:a";
+            argv[argc++] = "aac";
+            argv[argc++] = "-b:a";
+            argv[argc++] = "128k";
+        }
         argv[argc++] = "-f";
         argv[argc++] = "mpegts";
     }
@@ -176,7 +199,7 @@ static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, 
     return argv;
 }
 
-int handle_transcode(int sockfd, TranscodeBackend backend, TranscodeCodec codec, const char *channel) {
+int handle_transcode(int sockfd, TranscodeBackend backend, TranscodeCodec codec, const char *channel, int surround51) {
     extern void send_response(int sockfd, const char *status, const char *type, const char *body);
     extern char channels_conf_path[512];
     
@@ -238,7 +261,7 @@ int handle_transcode(int sockfd, TranscodeBackend backend, TranscodeCodec codec,
         close(ffmpeg_pipe[1]);
         
         int argc;
-        char **argv = build_ffmpeg_args(backend, codec, &argc);
+        char **argv = build_ffmpeg_args(backend, codec, surround51, &argc);
         execvp("ffmpeg", argv);
         exit(1);
     }
