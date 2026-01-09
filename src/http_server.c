@@ -15,6 +15,7 @@
 #include "channels.h"
 #include "db.h"
 #include "tuner.h"
+#include "transcode.h"
 
 // Helper to find a specific header in the HTTP request buffer
 static char *find_header(const char *buffer, const char *header_name) {
@@ -268,6 +269,48 @@ void *client_thread(void *arg) {
         } else if (strncmp(path, "/stream/", 8) == 0) {
             char *chan = path + 8;
             handle_stream(sockfd, chan);
+        } else if (strncmp(path, "/transcode/", 11) == 0) {
+            // Parse /transcode/{backend}/{codec}/{channel}
+            char backend_str[32] = {0};
+            char codec_str[32] = {0};
+            char chan_str[64] = {0};
+            char *p = path + 11;
+            char *slash1 = strchr(p, '/');
+            if (slash1) {
+                strncpy(backend_str, p, slash1 - p);
+                char *slash2 = strchr(slash1 + 1, '/');
+                if (slash2) {
+                    strncpy(codec_str, slash1 + 1, slash2 - slash1 - 1);
+                    strncpy(chan_str, slash2 + 1, sizeof(chan_str) - 1);
+                }
+            }
+            TranscodeBackend backend = parse_backend(backend_str);
+            TranscodeCodec codec = parse_codec(codec_str);
+            if (backend == BACKEND_INVALID || codec == CODEC_INVALID || chan_str[0] == '\0') {
+                send_response(sockfd, "400 Bad Request", "text/plain", "Invalid transcode parameters");
+            } else {
+                handle_transcode(sockfd, backend, codec, chan_str);
+            }
+        } else if (strncmp(path, "/playlist/", 10) == 0) {
+            // Parse /playlist/{backend}/{codec}.m3u
+            char backend_str[32] = {0};
+            char codec_str[32] = {0};
+            char *p = path + 10;
+            char *slash = strchr(p, '/');
+            if (slash) {
+                strncpy(backend_str, p, slash - p);
+                char *dot = strstr(slash + 1, ".m3u");
+                if (dot) {
+                    strncpy(codec_str, slash + 1, dot - slash - 1);
+                }
+            }
+            TranscodeBackend backend = parse_backend(backend_str);
+            TranscodeCodec codec = parse_codec(codec_str);
+            if (backend == BACKEND_INVALID || codec == CODEC_INVALID) {
+                send_response(sockfd, "400 Bad Request", "text/plain", "Invalid playlist parameters");
+            } else {
+                handle_transcode_m3u(sockfd, host, backend_str, codec_str);
+            }
         } else {
             send_response(sockfd, "404 Not Found", "text/plain", "Not Found");
         }
