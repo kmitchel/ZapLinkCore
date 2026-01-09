@@ -175,7 +175,9 @@ static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, 
     } else {
         // H.264/HEVC use MPEG-TS with AAC
         if (surround51) {
-            // Keep 5.1 surround
+            // 5.1 surround: remap 5.1(side) to standard 5.1 layout
+            argv[argc++] = "-af";
+            argv[argc++] = "channelmap=channel_layout=5.1";
             argv[argc++] = "-c:a";
             argv[argc++] = "aac";
             argv[argc++] = "-b:a";
