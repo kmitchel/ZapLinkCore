@@ -78,15 +78,29 @@ static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, 
     switch (backend) {
         case BACKEND_SOFTWARE:
             switch (codec) {
-                case CODEC_H264: argv[argc++] = "libx264"; break;
-                case CODEC_HEVC: argv[argc++] = "libx265"; break;
-                case CODEC_AV1:  argv[argc++] = "libsvtav1"; break;
+                case CODEC_H264: 
+                    argv[argc++] = "libx264";
+                    argv[argc++] = "-preset";
+                    argv[argc++] = "veryfast";
+                    argv[argc++] = "-crf";
+                    argv[argc++] = "23";
+                    break;
+                case CODEC_HEVC: 
+                    argv[argc++] = "libx265";
+                    argv[argc++] = "-preset";
+                    argv[argc++] = "veryfast";
+                    argv[argc++] = "-crf";
+                    argv[argc++] = "28";
+                    break;
+                case CODEC_AV1:  
+                    argv[argc++] = "libsvtav1";
+                    argv[argc++] = "-preset";
+                    argv[argc++] = "8";  // SVT-AV1 uses 0-13 (8 = fast)
+                    argv[argc++] = "-crf";
+                    argv[argc++] = "30";
+                    break;
                 default: break;
             }
-            argv[argc++] = "-preset";
-            argv[argc++] = "veryfast";
-            argv[argc++] = "-crf";
-            argv[argc++] = "23";
             break;
             
         case BACKEND_QSV:
