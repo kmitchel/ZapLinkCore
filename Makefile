@@ -48,4 +48,42 @@ clean:
 
 local: $(TARGET)
 
-.PHONY: all clean setup cleanup local
+# Installation
+PREFIX ?= /usr/local
+BINDIR = $(PREFIX)/bin
+CONFDIR = /etc/zaplink
+SERVICEFILE = zaplinkcore.service
+
+install: $(TARGET)
+	@echo "Creating zaplink user..."
+	@id -u zaplink &>/dev/null || useradd -r -s /usr/sbin/nologin -d $(CONFDIR) zaplink
+	@echo "Creating config directory..."
+	@mkdir -p $(CONFDIR)
+	@chown zaplink:zaplink $(CONFDIR)
+	@echo "Installing binary..."
+	@install -m 755 $(TARGET) $(BINDIR)/zaplinkcore
+	@echo "Installing support files..."
+	@test -f huffman.bin && install -m 644 huffman.bin $(CONFDIR)/ || true
+	@echo "Installing systemd service..."
+	@install -m 644 $(SERVICEFILE) /etc/systemd/system/
+	@systemctl daemon-reload
+	@echo ""
+	@echo "Installation complete!"
+	@echo "  Config directory: $(CONFDIR)"
+	@echo "  Binary: $(BINDIR)/zaplinkcore"
+	@echo ""
+	@echo "Next steps:"
+	@echo "  1. Copy channels.conf to $(CONFDIR)/"
+	@echo "  2. Run: sudo systemctl enable --now zaplinkcore"
+
+uninstall:
+	@echo "Stopping service..."
+	-@systemctl stop zaplinkcore 2>/dev/null || true
+	-@systemctl disable zaplinkcore 2>/dev/null || true
+	@echo "Removing files..."
+	@rm -f /etc/systemd/system/$(SERVICEFILE)
+	@rm -f $(BINDIR)/zaplinkcore
+	@systemctl daemon-reload
+	@echo "Uninstall complete. Config directory $(CONFDIR) preserved."
+
+.PHONY: all clean setup cleanup local install uninstall
