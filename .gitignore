@@ -1,0 +1,8 @@
+build/
+*.conf
+*.db
+PROGRESS.md
+TODO.md
+deps/
+*.o
+.DS_Store

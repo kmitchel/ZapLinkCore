@@ -1,7 +1,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#define DEFAULT_PORT 5000
+#define DEFAULT_PORT 18392
 #define CHANNELS_CONF "./channels.conf"
 #define DB_PATH "epg.db"
 #define MAX_TUNERS 16

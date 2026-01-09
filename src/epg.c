@@ -12,77 +12,262 @@
 #include "tuner.h"
 #include "channels.h"
 #include "db.h"
+#include "huffman.h"
 
-static pthread_t epg_tid;
-static int epg_running = 0;
+// -----------------------------------------------------------------------------
+// Data Structures
+// -----------------------------------------------------------------------------
 
-// Internal helpers
-void scan_mux(Tuner *t, const char *frequency, const char *channel_name);
-int parse_ts_chunk(const unsigned char *buf, size_t len, const char *freq);
-
-// TS Packet size is 188
 #define TS_PACKET_SIZE 188
+#define MAX_EIT_PIDS 8
 
-// EPG Loop
-void *epg_worker(void *arg) {
+typedef struct {
+    unsigned char buffer[4096];
+    int len;
+    int expected_len;
+    int active;
+} SectionBuffer;
+
+// Per-scan context to allow concurrent scanning
+typedef struct {
+    SectionBuffer pid_buffers[8192];
+    int eit_pids[MAX_EIT_PIDS];
+    int eit_pid_count;
+    const char *freq;
+} ScanContext;
+
+typedef struct {
+    char key[64];
+    char val[16];
+} SourceMap;
+
+static SourceMap source_map[256];
+static int source_map_count = 0;
+static pthread_mutex_t source_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Job Queue for Muxes
+typedef struct {
+    char freq[32];
+    char name[64];
+    char number[32];
+} MuxJob;
+
+#define MAX_MUX_QUEUE 256
+static MuxJob mux_queue[MAX_MUX_QUEUE];
+static int mux_queue_head = 0;
+static int mux_queue_tail = 0;
+static int mux_queue_count = 0;
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+
+int epg_running = 0;
+int epg_skip_first = 0;
+static int epg_completed_cycles = 0;
+static pthread_mutex_t cycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cycle_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t worker_threads[MAX_TUNERS];
+
+// -----------------------------------------------------------------------------
+// Prototypes
+// -----------------------------------------------------------------------------
+
+void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char *channel_name);
+void handle_section(ScanContext *ctx, int pid, unsigned char *section, int len);
+int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len);
+void parse_atsc_vct(ScanContext *ctx, unsigned char *section, int len);
+void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len);
+void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len);
+
+// -----------------------------------------------------------------------------
+// Source Map Helpers (Thread-Safe)
+// -----------------------------------------------------------------------------
+
+void add_source_map(const char *freq, int source_id, const char *chan_num) {
+    char key[64];
+    snprintf(key, sizeof(key), "%s_%d", freq, source_id);
+    
+    pthread_mutex_lock(&source_map_mutex);
+    for(int i=0; i<source_map_count; i++) {
+        if (strcmp(source_map[i].key, key) == 0) {
+            pthread_mutex_unlock(&source_map_mutex);
+            return;
+        }
+    }
+    if (source_map_count < 256) {
+        strcpy(source_map[source_map_count].key, key);
+        strcpy(source_map[source_map_count].val, chan_num);
+        source_map_count++;
+    }
+    pthread_mutex_unlock(&source_map_mutex);
+}
+
+const char *get_source_map(const char *freq, int source_id) {
+    static char result[16];
+    char key[64];
+    snprintf(key, sizeof(key), "%s_%d", freq, source_id);
+    
+    pthread_mutex_lock(&source_map_mutex);
+    for(int i=0; i<source_map_count; i++) {
+        if (strcmp(source_map[i].key, key) == 0) {
+            strncpy(result, source_map[i].val, sizeof(result));
+            pthread_mutex_unlock(&source_map_mutex);
+            return result;
+        }
+    }
+    pthread_mutex_unlock(&source_map_mutex);
+    return NULL;
+}
+
+const char *get_first_channel_on_freq(const char *freq) {
+    static char result[16];
+    pthread_mutex_lock(&source_map_mutex);
+    for(int i=0; i<source_map_count; i++) {
+        if (strncmp(source_map[i].key, freq, strlen(freq)) == 0 && source_map[i].key[strlen(freq)] == '_') {
+            strncpy(result, source_map[i].val, sizeof(result));
+            pthread_mutex_unlock(&source_map_mutex);
+            return result;
+        }
+    }
+    pthread_mutex_unlock(&source_map_mutex);
+    return NULL;
+}
+
+// -----------------------------------------------------------------------------
+// Job Queue Helpers
+// -----------------------------------------------------------------------------
+
+static void enqueue_mux(const char *freq, const char *name, const char *num) {
+    pthread_mutex_lock(&queue_mutex);
+    if (mux_queue_count < MAX_MUX_QUEUE) {
+        strcpy(mux_queue[mux_queue_tail].freq, freq);
+        strcpy(mux_queue[mux_queue_tail].name, name);
+        strcpy(mux_queue[mux_queue_tail].number, num);
+        mux_queue_tail = (mux_queue_tail + 1) % MAX_MUX_QUEUE;
+        mux_queue_count++;
+        pthread_cond_signal(&queue_cond);
+    }
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+int dequeue_mux(MuxJob *job) {
+    pthread_mutex_lock(&queue_mutex);
+    while (mux_queue_count == 0 && epg_running) {
+        pthread_cond_wait(&queue_cond, &queue_mutex);
+    }
+    if (!epg_running) {
+        pthread_mutex_unlock(&queue_mutex);
+        return 0;
+    }
+    *job = mux_queue[mux_queue_head];
+    mux_queue_head = (mux_queue_head + 1) % MAX_MUX_QUEUE;
+    mux_queue_count--;
+    pthread_mutex_unlock(&queue_mutex);
+    return 1;
+}
+
+// -----------------------------------------------------------------------------
+// Scanner Thread
+// -----------------------------------------------------------------------------
+
+void *scanner_worker(void *arg) {
+    free(arg);
+    while (epg_running) {
+        MuxJob job;
+        if (!dequeue_mux(&job)) break;
+
+        Tuner *t = acquire_tuner(USER_EPG);
+        if (!t) {
+            // Should not happen as we have as many threads as tuners, 
+            // but just in case, requeue and wait
+            usleep(1000000);
+            enqueue_mux(job.freq, job.name, job.number);
+            continue;
+        }
+
+        ScanContext *ctx = calloc(1, sizeof(ScanContext));
+        ctx->freq = job.freq;
+        
+        scan_mux(t, ctx, job.number, job.name);
+        
+        // Re-check if we were preempted (zap_pid will be 0 if killed by release_tuner)
+        // Actually, scan_mux returns when the read fails.
+        // If we want to requeue, we should check if we finished or were killed.
+        // For simplicity, we'll requeue if scan_mux didn't finish the 15s.
+        // But scan_mux is synchronous and waitpid happens inside.
+        
+        free(ctx);
+        release_tuner(t);
+    }
+    return NULL;
+}
+
+// -----------------------------------------------------------------------------
+// EPG Thread (Orchestrator)
+// -----------------------------------------------------------------------------
+
+void *epg_orchestrator(void *arg) {
     (void)arg;
     
-    // Initial delay to let server start
-    sleep(5); 
+    // Coordination: if skipping first scan, we sleep 15 mins first.
+    // If not skipping, we scan immediately.
+    
+    if (epg_skip_first) {
+        printf("[EPG] Database has data. Skipping initial scan cycle.\n");
+        fflush(stdout);
+        // Sleep 15 mins (broken into chunks to allow exit)
+        for(int k=0; k<15*60; k++) {
+            if (!epg_running) break;
+            sleep(1);
+        }
+    }
 
     while (epg_running) {
         printf("[EPG] Starting scan cycle...\n");
+        fflush(stdout);
+        db_cleanup_expired();
 
-        // 1. Identify unique frequencies (muxes)
-        // Simple deduplication
+        pthread_mutex_lock(&source_map_mutex);
+        source_map_count = 0;
+        pthread_mutex_unlock(&source_map_mutex);
+
+        // 1. Identify unique muxes and enqueue
         char scanned_freqs[MAX_CHANNELS][32];
         int scanned_count = 0;
 
         for (int i = 0; i < channel_count; i++) {
-            if (!epg_running) break;
-
             Channel *c = &channels[i];
-            
-            // Check if already scanned
             int already = 0;
             for(int k=0; k<scanned_count; k++) {
                 if (strcmp(scanned_freqs[k], c->frequency) == 0) {
-                    already = 1;
-                    break;
+                    already = 1; break;
                 }
             }
             if (already) continue;
-
-            // Mark scanned
             strcpy(scanned_freqs[scanned_count++], c->frequency);
-
-            // 2. Acquire Tuner
-            Tuner *t = acquire_tuner();
-            int retries = 5;
-            while (!t && retries-- > 0) {
-                if (!epg_running) break;
-                sleep(1);
-                t = acquire_tuner();
-            }
-
-            if (!t) {
-                printf("[EPG] No tuners available. Skipping...\n");
-                sleep(5);
-                continue;
-            }
-
-            t->in_use = 1;
-            // Scan Mux
-            scan_mux(t, c->frequency, c->name);
-            
-            release_tuner(t);
-            
-            // Wait between muxes
-            sleep(2);
+            enqueue_mux(c->frequency, c->name, c->number);
         }
 
-        printf("[EPG] Scan cycle complete. Sleeping 15 minutes...\n");
-        // Sleep 15 mins (broken into chunks to allow exit)
+        // Wait for all jobs to be processed
+        while (1) {
+            pthread_mutex_lock(&queue_mutex);
+            int count = mux_queue_count;
+            pthread_mutex_unlock(&queue_mutex);
+            if (count == 0) break;
+            sleep(1);
+            if (!epg_running) break;
+        }
+
+        printf("[EPG] Scan cycle complete.\n");
+        fflush(stdout);
+
+        // Notify that a cycle has completed
+        pthread_mutex_lock(&cycle_mutex);
+        epg_completed_cycles++;
+        pthread_cond_broadcast(&cycle_cond);
+        pthread_mutex_unlock(&cycle_mutex);
+
+        printf("[EPG] Sleeping 15 minutes...\n");
+        fflush(stdout);
         for(int k=0; k<15*60; k++) {
             if (!epg_running) break;
             sleep(1);
@@ -91,68 +276,159 @@ void *epg_worker(void *arg) {
     return NULL;
 }
 
+void wait_for_first_epg_scan() {
+    printf("[EPG] Waiting for first scan cycle to complete...\n");
+    fflush(stdout);
+    pthread_mutex_lock(&cycle_mutex);
+    while (epg_completed_cycles == 0 && epg_running) {
+        pthread_cond_wait(&cycle_cond, &cycle_mutex);
+    }
+    pthread_mutex_unlock(&cycle_mutex);
+    printf("[EPG] First scan cycle detected. Proceeding.\n");
+    fflush(stdout);
+}
+
 void start_epg_thread() {
     if (epg_running) return;
     epg_running = 1;
-    pthread_create(&epg_tid, NULL, epg_worker, NULL);
+
+    // Start scanner threads (one per tuner)
+    for (int i = 0; i < tuner_count; i++) {
+        int *id = malloc(sizeof(int));
+        *id = i;
+        pthread_create(&worker_threads[i], NULL, scanner_worker, id);
+    }
+    
+    // Start orchestrator thread
+    pthread_t orch_tid;
+    pthread_create(&orch_tid, NULL, epg_orchestrator, NULL);
+    pthread_detach(orch_tid);
 }
 
 void stop_epg_thread() {
     epg_running = 0;
-    pthread_join(epg_tid, NULL);
+    pthread_cond_broadcast(&queue_cond);
+    for (int i = 0; i < tuner_count; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
+}
+
+// Decode ATSC Multiple String Structure (MSS)
+// Ref: A/65 Section 6.10
+static void atsc_mss_to_string(const unsigned char *buf, int len, char *dest, size_t dest_len) {
+    if (len < 1 || !dest || dest_len == 0) return;
+    dest[0] = '\0';
+
+    int num_strings = buf[0];
+    int pos = 1;
+
+    // We take the first string for simplicity (usually there's only one, or first is preferred)
+    for (int i = 0; i < num_strings; i++) {
+        if (pos + 4 > len) break;
+        // ISO_639_language_code (3 bytes)
+        // char lang[4] = { buf[pos], buf[pos+1], buf[pos+2], 0 };
+        int num_segments = buf[pos+3];
+        pos += 4;
+
+        for (int j = 0; j < num_segments; j++) {
+            if (pos + 3 > len) break;
+            unsigned char compr = buf[pos];
+            // unsigned char mode = buf[pos+1];
+            int n_bytes = buf[pos+2];
+            pos += 3;
+
+            if (pos + n_bytes > len) break;
+
+            if (compr == 0x00) {
+                // No compression
+                int to_copy = (n_bytes < (int)(dest_len - strlen(dest) - 1)) ? n_bytes : (int)(dest_len - strlen(dest) - 1);
+                if (to_copy > 0) {
+                    size_t cur_len = strlen(dest);
+                    memcpy(dest + cur_len, buf + pos, to_copy);
+                    dest[cur_len + to_copy] = '\0';
+                }
+            } else if (compr == 0x01 || compr == 0x02) {
+                // Huffman (A/65 Annex C)
+                if (!huffman_decode(compr, buf + pos, n_bytes, dest, dest_len)) {
+                    printf("[EPG] Failed to decode Huffman segment type 0x%02X\n", compr);
+                    const char *msg = "[Compressed]";
+                    if (dest_len - strlen(dest) > strlen(msg) + 1) strcat(dest, msg);
+                }
+            }
+            
+            pos += n_bytes;
+        }
+        
+        // If we processed one string, we stop (usually one lang is enough)
+        break;
+    }
+
+    // Sanitize
+    for (int i = 0; dest[i]; i++) {
+        if ((unsigned char)dest[i] < 0x20 || (unsigned char)dest[i] > 0x7E) dest[i] = ' ';
+    }
+    // Trim
+    int d_len = strlen(dest);
+    while (d_len > 0 && dest[d_len-1] == ' ') {
+        dest[--d_len] = '\0';
+    }
 }
 
 // -----------------------------------------------------------------------------
-// TS / PSI Parser Implementation (Skeleton)
+// TS / PSI Parser Implementation
 // -----------------------------------------------------------------------------
 
-// Section Buffer for Reassembly
-typedef struct {
-    unsigned char buffer[4096];
-    int len;
-    int expected_len;
-    int active;
-} SectionBuffer;
-
-// Map PIDs to Section Buffers (Simple Array for now, ATSC uses restricted PIDs mostly)
-// PID 0x1FFB (8187) is the big one for ATSC.
-SectionBuffer pid_buffers[8192];
-
-// Helpers to parse tables
-void parse_atsc_vct(unsigned char *section, int len, const char *freq);
-void parse_atsc_eit(unsigned char *section, int len, const char *freq);
-void parse_atsc_ett(unsigned char *section, int len, const char *freq);
-
-void handle_section(int pid, unsigned char *section, int len, const char *freq) {
+void handle_section(ScanContext *ctx, int pid, unsigned char *section, int len) {
     if (len < 3) return;
     unsigned char table_id = section[0];
     
-    if (pid == 0x1FFB) { // ATSC Base PID
+    int is_eit_pid = 0;
+    for (int k = 0; k < ctx->eit_pid_count; k++) {
+        if (ctx->eit_pids[k] == pid) { is_eit_pid = 1; break; }
+    }
+    
+    if (pid == 0x1FFB || is_eit_pid) {
+        if (table_id == 0xC7) {
+            // MGT
+            int tables_defined = (section[9] << 8) | section[10];
+            int loop_offset = 11;
+            for(int i=0; i<tables_defined; i++) {
+                if(loop_offset + 11 > len) break;
+                int type = (section[loop_offset] << 8) | section[loop_offset+1];
+                int t_pid = ((section[loop_offset+2] & 0x1F) << 8) | section[loop_offset+3];
+                
+                if (type >= 0x0100 && type <= 0x017F) {
+                    if (ctx->eit_pid_count < MAX_EIT_PIDS) {
+                        int found = 0;
+                        for (int k = 0; k < ctx->eit_pid_count; k++) {
+                            if (ctx->eit_pids[k] == t_pid) { found = 1; break; }
+                        }
+                        if (!found) ctx->eit_pids[ctx->eit_pid_count++] = t_pid;
+                    }
+                }
+                int desc_len = ((section[loop_offset+9] & 0x0F) << 8) | section[loop_offset+10];
+                loop_offset += 11 + desc_len;
+            }
+        }
         if (table_id == 0xC8 || table_id == 0xC9) {
-            parse_atsc_vct(section, len, freq);
-        } else if (table_id >= 0xCB && table_id <= 0xFB) {
-             parse_atsc_eit(section, len, freq);
-        }  else if (table_id >= 0xCC) {
-             // ETT (Text) logic if table_id matches EIT + offset logic or explicit range
-             // ATSC A/65: ETT 0xCC ... however strictly it's linked to EIT logic
-             parse_atsc_ett(section, len, freq);
+            parse_atsc_vct(ctx, section, len);
+        } else if (table_id == 0xCB) {
+            parse_atsc_eit(ctx, section, len);
+        } else if (table_id == 0xCC) {
+            parse_atsc_ett(ctx, section, len);
         }
     }
 }
 
-int parse_ts_chunk(const unsigned char *buf, size_t len, const char *freq) {
+int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len) {
     int packet_count = 0;
-    for (size_t i = 0; i < len - TS_PACKET_SIZE; i += TS_PACKET_SIZE) {
-        if (buf[i] != 0x47) {
-            // Re-sync?
-            // For now assume aligned
-            continue;
-        }
+    for (size_t i = 0; i + TS_PACKET_SIZE <= len; i += TS_PACKET_SIZE) {
+        if (buf[i] != 0x47) continue;
 
-        int tei = buf[i+1] & 0x80; // Transport Error Indicator
+        int tei = buf[i+1] & 0x80;
         if (tei) continue;
 
-        int pusi = buf[i+1] & 0x40; // Payload Unit Start Indicator
+        int pusi = buf[i+1] & 0x40;
         int pid = ((buf[i+1] & 0x1F) << 8) | buf[i+2];
         int adap = (buf[i+3] >> 4) & 0x3;
         int payload_offset = 4;
@@ -167,8 +443,13 @@ int parse_ts_chunk(const unsigned char *buf, size_t len, const char *freq) {
         unsigned char *payload = (unsigned char*)buf + i + payload_offset;
         int payload_len = TS_PACKET_SIZE - payload_offset;
 
-        // Skip non-interesting PIDs early
-        if (pid != 0x1FFB) continue; 
+        int interesting = (pid == 0x1FFB);
+        if (!interesting) {
+            for (int k = 0; k < ctx->eit_pid_count; k++) {
+                if (ctx->eit_pids[k] == pid) { interesting = 1; break; }
+            }
+        }
+        if (!interesting) continue; 
 
         if (pusi) {
             if (payload_len < 1) continue;
@@ -176,17 +457,14 @@ int parse_ts_chunk(const unsigned char *buf, size_t len, const char *freq) {
             payload++; payload_len--;
             
             if (pointer < payload_len) {
-                // If there was a previous section ending before pointer
-                if (pid_buffers[pid].active) {
-                    // Append remaining bytes
-                    if (pid_buffers[pid].len + pointer < 4096) {
-                        memcpy(pid_buffers[pid].buffer + pid_buffers[pid].len, payload, pointer);
-                        handle_section(pid, pid_buffers[pid].buffer, pid_buffers[pid].len + pointer, freq);
+                if (ctx->pid_buffers[pid].active) {
+                    if (ctx->pid_buffers[pid].len + pointer < 4096) {
+                        memcpy(ctx->pid_buffers[pid].buffer + ctx->pid_buffers[pid].len, payload, pointer);
+                        handle_section(ctx, pid, ctx->pid_buffers[pid].buffer, ctx->pid_buffers[pid].len + pointer);
                     }
-                    pid_buffers[pid].active = 0;
+                    ctx->pid_buffers[pid].active = 0;
                 }
 
-                // Start new section
                 unsigned char *sec_start = payload + pointer;
                 int sec_rem = payload_len - pointer;
                 if (sec_rem >= 3) {
@@ -194,28 +472,26 @@ int parse_ts_chunk(const unsigned char *buf, size_t len, const char *freq) {
                     int total_len = section_len + 3;
                     
                     if (sec_rem >= total_len) {
-                        // Full section in one packet
-                        handle_section(pid, sec_start, total_len, freq);
+                        handle_section(ctx, pid, sec_start, total_len);
                     } else {
-                        // Buffer it
-                        pid_buffers[pid].len = 0;
-                        memcpy(pid_buffers[pid].buffer, sec_start, sec_rem);
-                        pid_buffers[pid].len = sec_rem;
-                        pid_buffers[pid].expected_len = total_len;
-                        pid_buffers[pid].active = 1;
+                        ctx->pid_buffers[pid].len = 0;
+                        memcpy(ctx->pid_buffers[pid].buffer, sec_start, sec_rem);
+                        ctx->pid_buffers[pid].len = sec_rem;
+                        ctx->pid_buffers[pid].expected_len = total_len;
+                        ctx->pid_buffers[pid].active = 1;
                     }
                 }
             }
         } else {
-             if (pid_buffers[pid].active) {
-                 int needed = pid_buffers[pid].expected_len - pid_buffers[pid].len;
+             if (ctx->pid_buffers[pid].active) {
+                 int needed = ctx->pid_buffers[pid].expected_len - ctx->pid_buffers[pid].len;
                  int to_copy = (payload_len < needed) ? payload_len : needed;
-                 memcpy(pid_buffers[pid].buffer + pid_buffers[pid].len, payload, to_copy);
-                 pid_buffers[pid].len += to_copy;
+                 memcpy(ctx->pid_buffers[pid].buffer + ctx->pid_buffers[pid].len, payload, to_copy);
+                 ctx->pid_buffers[pid].len += to_copy;
 
-                 if (pid_buffers[pid].len >= pid_buffers[pid].expected_len) {
-                     handle_section(pid, pid_buffers[pid].buffer, pid_buffers[pid].len, freq);
-                     pid_buffers[pid].active = 0;
+                 if (ctx->pid_buffers[pid].len >= ctx->pid_buffers[pid].expected_len) {
+                     handle_section(ctx, pid, ctx->pid_buffers[pid].buffer, ctx->pid_buffers[pid].len);
+                     ctx->pid_buffers[pid].active = 0;
                  }
              }
         }
@@ -224,213 +500,148 @@ int parse_ts_chunk(const unsigned char *buf, size_t len, const char *freq) {
     return packet_count;
 }
 
-// Map "Freq_SourceId" -> "Major.Minor"
-// We need a simple hashmap or just a linear search array for this
-// Since C is raw, we'll implement a simple list
-typedef struct {
-    char key[64];
-    char val[16];
-} SourceMap;
-
-SourceMap source_map[256];
-int source_map_count = 0;
-
-void add_source_map(const char *freq, int source_id, const char *chan_num) {
-    char key[64];
-    snprintf(key, sizeof(key), "%s_%d", freq, source_id);
-    
-    // Update or Add
-    for(int i=0; i<source_map_count; i++) {
-        if (strcmp(source_map[i].key, key) == 0) return;
-    }
-    if (source_map_count < 256) {
-        strcpy(source_map[source_map_count].key, key);
-        strcpy(source_map[source_map_count].val, chan_num);
-        source_map_count++;
-    }
-}
-
-const char *get_source_map(const char *freq, int source_id) {
-    char key[64];
-    snprintf(key, sizeof(key), "%s_%d", freq, source_id);
-    for(int i=0; i<source_map_count; i++) {
-        if (strcmp(source_map[i].key, key) == 0) return source_map[i].val;
-    }
-    return NULL;
-}
-
 // -----------------------------------------------------------------------------
 // ATSC Parsing Logic
 // -----------------------------------------------------------------------------
 
-void parse_atsc_vct(unsigned char *section, int len, const char *freq) {
-    // VCT parsing logic
-    // Skip header (table_id..protocol_version) -> offset 10
+void parse_atsc_vct(ScanContext *ctx, unsigned char *section, int len) {
     int num_channels = section[9];
     int offset = 10;
     
-    for (int i=0; i<num_channels; i++) {
+    for (int i = 0; i < num_channels; i++) {
         if (offset + 32 > len) break;
-        // Major: byte 4 (hi 4) | byte 5 (hi 6 shifted) -> actually split differently
-        // JS: major = ((section[offset + 4] & 0x0f) << 6) | (section[offset + 5] >> 2);
-        // JS: minor = ((section[offset + 5] & 0x03) << 8) | section[offset + 6];
-        int major = ((section[offset + 4] & 0x0f) << 6) | (section[offset + 5] >> 2);
-        int minor = ((section[offset + 5] & 0x03) << 8) | section[offset + 6];
-        int source_id = (section[offset + 22] << 8) | section[offset + 23];
+        int major = ((section[offset + 14] & 0x0F) << 6) | ((section[offset + 15] & 0xFC) >> 2);
+        int minor = ((section[offset + 15] & 0x03) << 8) | section[offset + 16];
+        int source_id = (section[offset + 28] << 8) | section[offset + 29];
         
         char chan_num[16];
         snprintf(chan_num, sizeof(chan_num), "%d.%d", major, minor);
-        
-        add_source_map(freq, source_id, chan_num);
-        // printf("[EPG DEBUG] Mapped SourceID %d -> %s on %s\n", source_id, chan_num, freq);
+        add_source_map(ctx->freq, source_id, chan_num);
 
-        int desc_len = ((section[offset+30] & 0x03) << 8) | section[offset+31];
+        int desc_len = ((section[offset + 30] & 0x03) << 8) | section[offset + 31];
         offset += 32 + desc_len;
     }
 }
 
-void parse_atsc_eit(unsigned char *section, int len, const char *freq) {
-    // EIT parsing
-    // Header 10 bytes
+void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
     int source_id = (section[3] << 8) | section[4];
     int num_events = section[9];
     int offset = 10;
 
-    const char *chan_num = get_source_map(freq, source_id);
-    char fallback_num[32];
+    const char *chan_num = get_source_map(ctx->freq, source_id);
+    if (!chan_num) return;
+
+    for (int i = 0; i < num_events; i++) {
+        if (offset + 10 > len) break;
+        int event_id = ((section[offset] & 0x3F) << 8) | section[offset + 1];
+        unsigned int start_time_gps = (section[offset + 2] << 24) | (section[offset + 3] << 16) | (section[offset + 4] << 8) | section[offset + 5];
+        int duration = ((section[offset + 6] & 0x0F) << 16) | (section[offset + 7] << 8) | section[offset + 8];
+        int title_len = section[offset + 9];
+
+        long long start_ms = ((long long)start_time_gps + 315964800LL - 18) * 1000;
+        long long end_ms = start_ms + ((long long)duration * 1000);
+
+        time_t start_sec = start_ms / 1000;
+        struct tm *tm_info = gmtime(&start_sec);
+        if (tm_info) {
+            int year = tm_info->tm_year + 1900;
+            time_t now = time(NULL);
+            struct tm *now_tm = gmtime(&now);
+            int current_year = now_tm ? now_tm->tm_year + 1900 : 2026;
+            if (year < 2000 || year > current_year + 2) break;
+        }
+
+        char title[256] = {0};
+        if (title_len > 0) {
+            int str_offset = offset + 10;
+            if (str_offset + title_len <= len) {
+                atsc_mss_to_string(section + str_offset, title_len, title, sizeof(title));
+            }
+        }
+
+        if (title[0] != '\0' && start_ms > 0) {
+            db_upsert_program(ctx->freq, chan_num, start_ms, end_ms, title, event_id, source_id);
+        }
+
+        int after_title = offset + 10 + title_len;
+        if (after_title + 2 <= len) {
+            int desc_len = ((section[after_title] & 0x0F) << 8) | section[after_title + 1];
+            offset = after_title + 2 + desc_len;
+        } else break;
+    }
+}
+
+void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len) {
+    if (len < 17) return;
+    int source_id_from_header = (section[3] << 8) | section[4];
+    unsigned int etm_id = (section[9] << 24) | (section[10] << 16) | (section[11] << 8) | section[12];
+    int event_id = (etm_id >> 2) & 0x3FFF;
+    
+    const char *chan_num = get_source_map(ctx->freq, source_id_from_header);
     if (!chan_num) {
-         snprintf(fallback_num, sizeof(fallback_num), "%d", source_id);
-         chan_num = fallback_num;
+        const char *first = get_first_channel_on_freq(ctx->freq);
+        if (first) chan_num = first; else return;
     }
-
-    for (int i=0; i<num_events; i++) {
-         if (offset + 10 > len) break;
-         int event_id = ((section[offset] & 0x3F) << 8) | section[offset+1];
-         unsigned int start_time = (section[offset+2] << 24) | (section[offset+3] << 16) | (section[offset+4] << 8) | section[offset+5];
-         int duration = ((section[offset+6] & 0x0F) << 16) | (section[offset+7] << 8) | section[offset+8];
-         int title_len = section[offset+9];
-         
-         // GPS base: 1980-01-06 00:00:00 UTC
-         // JS calc: (startTimeGPS + 315964800 - 18) * 1000
-         // 315964800 is diff between GPS epoch and UNIX epoch (1970) roughly? 
-         // GPS epoch is Jan 6 1980. Unix is Jan 1 1970.
-         // Diff is 10 years + leap days.
-         // Let's trust JS math: unix_ts = gps + 315964800ULL
-         // Subtract 18 leap seconds? TS usually includes leap seconds handling or not?
-         // JS says - 18.
-         
-         long long start_ms = ((long long)start_time + 315964800ULL - 18) * 1000;
-         long long end_ms = start_ms + (duration * 1000);
-
-         char title[256] = {0};
-         if (title_len > 0) {
-             // Multiple String Structure
-             // [num_strings][...strings]
-             // Simply grabbing first string
-             int str_offset = offset + 10;
-             if (str_offset + title_len <= len) {
-                 int num_strings = section[str_offset];
-                 if (num_strings > 0) {
-                     // 3 bytes lang code usually? NO, ATSC text structure is complex.
-                     // JS: section[stringOffset + 6] is len.
-                     // Header is usually [lang 3][segments 1][seg type 1][seg len 1]...
-                     // Start simply.
-                     // JS: stringOffset = 1. stringLen = buffer[stringOffset+6]?
-                     // Wait, simple buffer dump often reveals string.
-                     // Let's be safe.
-                     // Logic: slice(str_offset + 1 + 6, ... len)
-                     if (title_len > 7) {
-                         int t_len = section[str_offset + 1 + 6];
-                         int t_start = str_offset + 1 + 7;
-                         if (t_len < sizeof(title) - 1 && t_start + t_len <= len) {
-                             memcpy(title, section + t_start, t_len);
-                             title[t_len] = 0;
-                         }
-                     }
-                 }
-             }
-         }
-         
-         // Insert into DB
-         if (strlen(title) > 0) {
-             // We need an exposed DB insert function
-             // "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, event_id, source_id) ... "
-             // We'll create a new DB function or execute raw SQL here if we expose db handle (not ideal)
-             // Best to add `db_upsert_program` in db.c
-             db_upsert_program(freq, chan_num, start_ms, end_ms, title, event_id, source_id);
-             // printf("[EPG DEBUG] Found Event: %s (%s)\n", title, chan_num);
-         }
-
-         offset += 10 + title_len;
-         // Clean descriptors?
-         // In ATSC EIT, descriptors are NOT in the loop the same way?
-         // Wait, "title_len" IS "length_in_bytes" of the title_text().
-         // Then "descriptors_length" FOLLOWS title parsing? No.
-         // Inspect ATSC Spec A/65.
-         // event_loop_item: ... title_length, title_text(), descriptors_length, descriptors()
-         // JS code: 
-         // offset += 2 + descriptorsLength ??
-         // Line 358: if (currentEventOffset + 2 <= section.length - 4) ... descriptorsLength = ...
-         // My loop missed the descriptors length check.
-         // Let's correct offset logic.
-         
-         // current_offset is now at end of title.
-         // Next 12 bits are reserved + descriptors_length.
-         int d_len_idx = offset; // offset is currently START of loop + 10 + title_len?
-         // No. initialization `offset = 10`.
-         // Inside loop: `offset` points to event_id.
-         // `title_len` is at `offset + 9`.
-         // `title_text` is `offset + 10` ... `offset + 10 + title_len`.
-         // `descriptors_length` is at `offset + 10 + title_len` (12 bits).
-         
-         int after_title = offset + 10 + title_len;
-         if (after_title + 2 <= len) {
-             int desc_len = ((section[after_title] & 0x0F) << 8) | section[after_title+1];
-             offset = after_title + 2 + desc_len;
-         } else {
-             break; 
-         }
-    }
+    
+    int section_length = ((section[1] & 0x0F) << 8) | section[2];
+    int mss_start = 13;
+    int mss_end = section_length + 3 - 4; // Minus CRC
+    int mss_len = mss_end - mss_start;
+    if (mss_len < 1 || mss_start + mss_len > len) return;
+    
+    char desc[1024] = {0};
+    atsc_mss_to_string(section + mss_start, mss_len, desc, sizeof(desc));
+    
+    if (desc[0] != '\0') db_update_program_description(ctx->freq, chan_num, event_id, desc);
 }
 
-void parse_atsc_ett(unsigned char *section, int len, const char *freq) {
-    (void)section; (void)len; (void)freq;
-    // TODO: Extended Text (Descriptions)
-}
-
-void scan_mux(Tuner *t, const char *frequency, const char *channel_name) {
+void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char *channel_name) {
     int pipefd[2];
     if (pipe(pipefd) == -1) return;
-
-    printf("[EPG] Scanning Mux %s (%s) on Tuner %d\n", frequency, channel_name, t->id);
+    
+    // Log with both for clarity, but zap with number
+    printf("[EPG] Scanning Mux %s (%s, #%s) on Tuner %d\n", ctx->freq, channel_name, channel_number, t->id);
 
     pid_t pid = fork();
     if (pid == 0) {
-        // Child
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
-
         char adapter_id[8];
         snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
-        
-        // Scan for 15 seconds
-        // dvbv5-zap -c ... -a ... -P -t 15 -o - channel_name
-        execlp("dvbv5-zap", "dvbv5-zap", "-c", CHANNELS_CONF, "-a", adapter_id, "-P", "-t", "15", "-o", "-", channel_name, NULL);
+        execlp("dvbv5-zap", "dvbv5-zap", "-c", channels_conf_path, "-a", adapter_id, "-P", "-t", "15", "-o", "-", channel_number, NULL);
         exit(1);
     } else if (pid > 0) {
-        // Parent
-        t->zap_pid = pid; // Track process to kill if needed
+        t->zap_pid = pid;
         close(pipefd[1]);
 
-        unsigned char buf[4096 * 4];
+        unsigned char buf[1024 * 32];
+        int leftover = 0;
         ssize_t n;
-        while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
-             parse_ts_chunk(buf, n, frequency);
+
+        while ((n = read(pipefd[0], buf + leftover, sizeof(buf) - leftover)) > 0) {
+            int total_len = leftover + n;
+            int packet_count = total_len / TS_PACKET_SIZE;
+            int bytes_to_process = packet_count * TS_PACKET_SIZE;
+            if (bytes_to_process > 0) parse_ts_chunk(ctx, buf, bytes_to_process);
+            leftover = total_len - bytes_to_process;
+            if (leftover > 0) memmove(buf, buf + bytes_to_process, leftover);
+        }
+
+        // If read returned < 0 and errno is not 0, we might have been preempted.
+        // Actually, if release_tuner kills the process, read will return 0 or error.
+        // Let's check if the child exited or was signaled.
+        int status;
+        waitpid(pid, &status, 0);
+        t->zap_pid = 0;
+        
+        if (WIFSIGNALED(status)) {
+            printf("[EPG] Scan of %s interrupted (likely preempted)\n", ctx->freq);
+            fflush(stdout);
+            // Re-enqueue
+            enqueue_mux(ctx->freq, channel_name, channel_number);
         }
 
         close(pipefd[0]);
-        waitpid(pid, NULL, 0);
-        t->zap_pid = 0;
     }
 }

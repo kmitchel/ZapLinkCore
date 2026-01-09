@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,40 +9,108 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <ctype.h>
 #include "http_server.h"
 #include "config.h"
 #include "channels.h"
 #include "db.h"
 #include "tuner.h"
 
+// Helper to find a specific header in the HTTP request buffer
+static char *find_header(const char *buffer, const char *header_name) {
+    char search[128];
+    snprintf(search, sizeof(search), "%s:", header_name);
+    char *p = strcasestr(buffer, search);
+    
+    // Ensure it's the start of a line or the first line
+    if (p) {
+        if (p != buffer && *(p-1) != '\n' && *(p-1) != '\r') {
+             // Not at start of line, try finding next occurrence
+             char *next = strcasestr(p + 1, search);
+             while (next) {
+                 if (*(next-1) == '\n' || *(next-1) == '\r') {
+                     p = next;
+                     break;
+                 }
+                 next = strcasestr(next + 1, search);
+             }
+             if (!next) p = NULL;
+        }
+    }
+    
+    if (p) {
+        p += strlen(header_name);
+        if (*p == ':') p++; // Skip colon
+        while (*p == ' ' || *p == '\t') p++;
+        
+        const char *end = strchr(p, '\r');
+        if (!end) end = strchr(p, '\n');
+        if (end) {
+            int len = end - p;
+            char *val = malloc(len + 1);
+            memcpy(val, p, len);
+            val[len] = '\0';
+            return val;
+        }
+    }
+    return NULL;
+}
+
 void send_response(int sockfd, const char *status, const char *type, const char *body) {
     char header[1024];
-    int len = strlen(body);
+    int len = body ? strlen(body) : 0;
     snprintf(header, sizeof(header), 
         "HTTP/1.1 %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n"
         "\r\n", status, type, len);
     
     write(sockfd, header, strlen(header));
-    write(sockfd, body, len);
+    if (body && len > 0) {
+        write(sockfd, body, len);
+    }
 }
 
-void handle_m3u(int sockfd) {
-    char *m3u = malloc(1024 * 64); // 64K buffer
-    char *p = m3u;
-    strcpy(p, "#EXTM3U\n");
-    p += strlen(p);
-    
-    for(int i=0; i<channel_count; i++) {
-        // Assume localhost for now, or trace Host header if eager
-        char buf[256];
-        snprintf(buf, sizeof(buf), "#EXTINF:-1 tvg-id=\"%s\" tvg-name=\"%s\",%s %s\nhttp://localhost:%d/stream/%s\n",
-            channels[i].number, channels[i].name, channels[i].number, channels[i].name, DEFAULT_PORT, channels[i].number);
-        strcpy(p, buf);
-        p += strlen(p);
+void handle_m3u(int sockfd, const char *host) {
+    // Dynamic allocation with bounds checking
+    size_t cap = 1024 * 64; // Start with 64K
+    size_t size = 0;
+    char *m3u = malloc(cap);
+    if (!m3u) {
+        send_response(sockfd, "500 Internal Server Error", "text/plain", "Memory allocation failed");
+        return;
     }
+    
+    // Use provided host or fallback to localhost
+    const char *display_host = (host && host[0] != '\0') ? host : "localhost";
+    
+    // Helper to append safely
+    #define APPEND_M3U(str) do { \
+        size_t slen = strlen(str); \
+        while (size + slen + 1 > cap) { \
+            cap *= 2; \
+            char *tmp = realloc(m3u, cap); \
+            if (!tmp) { free(m3u); send_response(sockfd, "500 Internal Server Error", "text/plain", "Memory error"); return; } \
+            m3u = tmp; \
+        } \
+        strcpy(m3u + size, str); \
+        size += slen; \
+    } while(0)
+    
+    APPEND_M3U("#EXTM3U\n");
+    
+    for (int i = 0; i < channel_count; i++) {
+        char buf[1024];
+        // If host header didn't have port, but we're on a non-standard port, 
+        // strictly speaking we should probably include it, but Host usually has it.
+        snprintf(buf, sizeof(buf), "#EXTINF:-1 tvg-id=\"%s\" tvg-name=\"%s\",%s %s\nhttp://%s/stream/%s\n",
+            channels[i].number, channels[i].name, channels[i].number, channels[i].name, display_host, channels[i].number);
+        APPEND_M3U(buf);
+    }
+    
+    #undef APPEND_M3U
     
     send_response(sockfd, "200 OK", "audio/x-mpegurl", m3u);
     free(m3u);
@@ -57,6 +126,17 @@ void handle_xmltv(int sockfd) {
     }
 }
 
+void handle_json(int sockfd) {
+    char *json = db_get_json_programs();
+    if (json) {
+        send_response(sockfd, "200 OK", "application/json", json);
+        free(json);
+    } else {
+        send_response(sockfd, "500 Internal Server Error", "text/plain", "Database Error");
+    }
+}
+
+
 void handle_stream(int sockfd, const char *channel) {
     // 1. Validate Channel
     Channel *c = find_channel_by_number(channel);
@@ -65,12 +145,12 @@ void handle_stream(int sockfd, const char *channel) {
         return;
     }
 
-    // 2. Acquire Tuner
-    Tuner *t = acquire_tuner();
+    // 2. Acquire Tuner for STREAM
+    Tuner *t = acquire_tuner(USER_STREAM);
     int retries = 5;
     while (!t && retries-- > 0) {
         usleep(500000); // 500ms
-        t = acquire_tuner();
+        t = acquire_tuner(USER_STREAM);
     }
     
     if (!t) {
@@ -78,14 +158,11 @@ void handle_stream(int sockfd, const char *channel) {
         return;
     }
 
-    // 3. Send Headers
-    const char *headers = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: key-alive\r\n\r\n";
-    write(sockfd, headers, strlen(headers));
-
-    // 4. Setup Pipes and Fork
+    // 3. Setup Pipes and Fork
     int pipefd[2];
     if (pipe(pipefd) == -1) {
         perror("pipe");
+        send_response(sockfd, "500 Internal Server Error", "text/plain", "Pipe creation failed");
         release_tuner(t);
         return;
     }
@@ -94,30 +171,31 @@ void handle_stream(int sockfd, const char *channel) {
     pid_t pid = fork();
     if (pid == 0) {
         // Child: exec dvbv5-zap
-        // Close read end
         close(pipefd[0]);
-        // Redir stdout to pipe write end
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
-        
-        // Prepare args
-        // dvbv5-zap -c channels.conf -r -a <adapter_id> -o - <channel_name>
-        // Note: channels.conf format usually needs channel NAME or VCHANNEL?
-        // Node implementation uses channel.number (vchannel) if using -c?
-        // Node: ['-c', CHANNELS_CONF, '-r', '-a', tuner.id, '-o', '-', channel.number]
         
         char adapter_id[8];
         snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
         
-        fprintf(stderr, "Executing: dvbv5-zap -c %s -r -a %s -o - \"%s\"\n", CHANNELS_CONF, adapter_id, c->name);
+        fprintf(stderr, "Executing: dvbv5-zap -c %s -P -a %s -o - \"%s\"\n", channels_conf_path, adapter_id, c->number);
 
-        execlp("dvbv5-zap", "dvbv5-zap", "-c", CHANNELS_CONF, "-r", "-a", adapter_id, "-o", "-", c->name, NULL);
+        execlp("dvbv5-zap", "dvbv5-zap", "-c", channels_conf_path, "-P", "-a", adapter_id, "-o", "-", c->number, NULL);
         perror("exec zap failed");
         exit(1);
     } else if (pid > 0) {
         // Parent
         t->zap_pid = pid;
         close(pipefd[1]); // Close write end
+        
+        // 4. Send Headers
+        const char *headers = 
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: video/mp2t\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n";
+        write(sockfd, headers, strlen(headers));
         
         // Loop: Read from pipe, Write to socket
         char buffer[4096];
@@ -130,13 +208,14 @@ void handle_stream(int sockfd, const char *channel) {
             }
         }
         
-        // Cleanup
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
+        // Cleanup - release_tuner handles process termination
         close(pipefd[0]);
         release_tuner(t);
     } else {
         perror("fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        send_response(sockfd, "500 Internal Server Error", "text/plain", "Fork failed");
         release_tuner(t);
     }
 }
@@ -145,7 +224,13 @@ void *client_thread(void *arg) {
     int sockfd = *(int*)arg;
     free(arg);
     
-    char buffer[2048];
+    // Set read timeout to prevent indefinite blocking
+    struct timeval tv;
+    tv.tv_sec = 30;  // 30 second timeout
+    tv.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    char buffer[4096];
     ssize_t n = read(sockfd, buffer, sizeof(buffer) - 1);
     if (n <= 0) {
         close(sockfd);
@@ -153,17 +238,33 @@ void *client_thread(void *arg) {
     }
     buffer[n] = 0;
 
-    // Very basic parsing
-    char method[16], path[256], protocol[16];
-    sscanf(buffer, "%s %s %s", method, path, protocol);
+    // Safe parsing with length limits
+    char method[16] = {0};
+    char path[256] = {0};
+    char protocol[16] = {0};
+    
+    if (sscanf(buffer, "%15s %255s %15s", method, path, protocol) < 2) {
+        send_response(sockfd, "400 Bad Request", "text/plain", "Malformed request");
+        close(sockfd);
+        return NULL;
+    }
     
     printf("Request: %s %s\n", method, path);
 
+    // Strip query string
+    char *query = strchr(path, '?');
+    if (query) *query = '\0';
+
+    // Find Host header
+    char *host = find_header(buffer, "Host");
+
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path, "/playlist.m3u") == 0) {
-            handle_m3u(sockfd);
+            handle_m3u(sockfd, host);
         } else if (strcmp(path, "/xmltv.xml") == 0) {
             handle_xmltv(sockfd);
+        } else if (strcmp(path, "/xmltv.json") == 0) {
+            handle_json(sockfd);
         } else if (strncmp(path, "/stream/", 8) == 0) {
             char *chan = path + 8;
             handle_stream(sockfd, chan);
@@ -174,6 +275,7 @@ void *client_thread(void *arg) {
         send_response(sockfd, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
     }
 
+    if (host) free(host);
     close(sockfd);
     return NULL;
 }
@@ -217,6 +319,10 @@ void start_http_server(int port) {
 
         pthread_t t;
         int *arg = malloc(sizeof(int));
+        if (!arg) {
+            close(newsockfd);
+            continue;
+        }
         *arg = newsockfd;
         if (pthread_create(&t, NULL, client_thread, arg) != 0) {
             perror("ERROR creating thread");
