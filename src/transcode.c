@@ -151,6 +151,9 @@ static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, 
     // Audio encoder and output format depend on codec
     if (codec == CODEC_AV1) {
         // AV1 uses WebM container with Opus audio
+        // Force stereo downmix for Opus (5.1 surround not supported by default)
+        argv[argc++] = "-ac";
+        argv[argc++] = "2";
         argv[argc++] = "-c:a";
         argv[argc++] = "libopus";
         argv[argc++] = "-b:a";
