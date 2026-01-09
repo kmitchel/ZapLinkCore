@@ -148,15 +148,24 @@ static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, 
             break;
     }
     
-    // Audio encoder
-    argv[argc++] = "-c:a";
-    argv[argc++] = "aac";
-    argv[argc++] = "-b:a";
-    argv[argc++] = "128k";
-    
-    // Output format
-    argv[argc++] = "-f";
-    argv[argc++] = "mpegts";
+    // Audio encoder and output format depend on codec
+    if (codec == CODEC_AV1) {
+        // AV1 uses WebM container with Opus audio
+        argv[argc++] = "-c:a";
+        argv[argc++] = "libopus";
+        argv[argc++] = "-b:a";
+        argv[argc++] = "128k";
+        argv[argc++] = "-f";
+        argv[argc++] = "webm";
+    } else {
+        // H.264/HEVC use MPEG-TS with AAC
+        argv[argc++] = "-c:a";
+        argv[argc++] = "aac";
+        argv[argc++] = "-b:a";
+        argv[argc++] = "128k";
+        argv[argc++] = "-f";
+        argv[argc++] = "mpegts";
+    }
     argv[argc++] = "pipe:1";
     
     argv[argc] = NULL;
@@ -237,12 +246,15 @@ int handle_transcode(int sockfd, TranscodeBackend backend, TranscodeCodec codec,
     close(zap_pipe[1]);
     close(ffmpeg_pipe[1]);
     
-    const char *headers = 
+    // Send headers with appropriate Content-Type
+    char headers[256];
+    const char *content_type = (codec == CODEC_AV1) ? "video/webm" : "video/mp2t";
+    snprintf(headers, sizeof(headers),
         "HTTP/1.1 200 OK\r\n"
-        "Content-Type: video/mp2t\r\n"
+        "Content-Type: %s\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: keep-alive\r\n"
-        "\r\n";
+        "\r\n", content_type);
     write(sockfd, headers, strlen(headers));
     
     char buffer[8192];
