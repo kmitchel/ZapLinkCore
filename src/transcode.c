@@ -67,10 +67,10 @@ static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, 
     argv[argc++] = "-i";
     argv[argc++] = "pipe:0";
     
-    // QSV H.264 needs deinterlacing to prevent crashes
+    // QSV H.264 needs deinterlacing to prevent crashes (use vpp_qsv for hardware deinterlace)
     if (backend == BACKEND_QSV && codec == CODEC_H264) {
         argv[argc++] = "-vf";
-        argv[argc++] = "yadif=mode=1";
+        argv[argc++] = "vpp_qsv=deinterlace=2";  // 2 = bob deinterlace
     }
     
     // Video encoder
