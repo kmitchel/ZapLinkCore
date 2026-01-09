@@ -28,8 +28,8 @@ TranscodeCodec parse_codec(const char *str) {
 // Build FFmpeg argument list based on backend and codec
 // Returns malloc'd argv array (caller frees)
 static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, int *argc_out) {
-    // Max 30 args should be plenty
-    char **argv = malloc(sizeof(char*) * 30);
+    // Max 50 args for all options
+    char **argv = malloc(sizeof(char*) * 50);
     int argc = 0;
     
     argv[argc++] = "ffmpeg";
@@ -62,6 +62,16 @@ static char **build_ffmpeg_args(TranscodeBackend backend, TranscodeCodec codec, 
         default:
             break;
     }
+    
+    // Robust MPEG-TS input options for OTA streams
+    argv[argc++] = "-fflags";
+    argv[argc++] = "+genpts+discardcorrupt+igndts";
+    argv[argc++] = "-err_detect";
+    argv[argc++] = "ignore_err";
+    argv[argc++] = "-probesize";
+    argv[argc++] = "5M";
+    argv[argc++] = "-analyzeduration";
+    argv[argc++] = "5M";
     
     // Input from stdin
     argv[argc++] = "-i";
