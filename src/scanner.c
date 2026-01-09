@@ -320,7 +320,7 @@ int scanner_check(const char *config_path) {
     }
     
     printf("\n============================================\n");
-    printf("        ZapCore Setup @ %s\n", config_path);
+    printf("        ZapLinkCore Setup @ %s\n", config_path);
     printf("============================================\n");
     
     int adapters = get_adapter_count();

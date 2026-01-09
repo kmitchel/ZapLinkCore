@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
     // Ignore SIGPIPE to prevent crash on client disconnect
     signal(SIGPIPE, SIG_IGN);
 
-    printf("Starting ZapCore...\n");
+    printf("Starting ZapLinkCore...\n");
     printf("Port: %d\n", port);
     printf("Channels Config: %s\n", channels_conf_path);
     fflush(stdout);

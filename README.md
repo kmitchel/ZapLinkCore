@@ -1,7 +1,13 @@
-# ZapCore
+# ZapLinkCore
 
-**ZapCore** is a high-performance C-based backend engine for the **ZapLinkTV** ecosystem. 
+**ZapLinkCore** is a high-performance C-based backend engine for the **ZapLink** ecosystem. 
 It serves a digital TV tuner (DVB/ATSC) over HTTP, providing rock-solid streaming, a standards-compliant XMLTV guide, and seamless network discovery.
+
+## 🌟 The ZapLink Ecosystem
+ZapLinkCore is the backbone of a multi-platform TV experience:
+- **ZapLinkCore**: The high-performance C backend (This project).
+- **ZapLinkWeb**: A modern web-based client for browser viewing.
+- **ZapLinkTV**: A native AndroidTV client for the big screen.
 
 ## 🚀 Key Features
 
@@ -16,13 +22,13 @@ It serves a digital TV tuner (DVB/ATSC) over HTTP, providing rock-solid streamin
 - **Concurrent Scanning**: Utilizes all available tuners to scan multiple frequencies in parallel, drastically reducing guide update times.
 
 ### **Zero-Conf Networking**
-- **mDNS Discovery**: Advertises as **"ZapCore"** (`_http._tcp`) on the local network. Clients can find it instantly without manual IP entry.
+- **mDNS Discovery**: Advertises as **"ZapLinkCore"** (`_http._tcp`) on the local network. Clients can find it instantly without manual IP entry.
 
 ---
 
 ## 📦 Build Instructions
 
-ZapCore offers a flexible build system for both system-integrated and self-contained deployments.
+ZapLinkCore offers a flexible build system for both system-integrated and self-contained deployments.
 
 ### Option A: Self-Contained Build (Recommended)
 Downloads and compiles dependencies (SQLite) locally, isolating the build from system libraries.
@@ -31,7 +37,7 @@ Downloads and compiles dependencies (SQLite) locally, isolating the build from s
 # 1. Download and compile dependencies to ./deps
 make setup
 
-# 2. Build ZapCore linked against local deps
+# 2. Build ZapLinkCore linked against local deps
 make local
 ```
 
@@ -52,7 +58,7 @@ make
 
 2. **Run**:
    ```bash
-   ./build/zapcore [options]
+   ./build/zaplinkcore [options]
    ```
    
    **Options:**
@@ -61,7 +67,7 @@ make
 
 3. **Example**:
    ```bash
-   ./build/zapcore -p 3000
+   ./build/zaplinkcore -p 3000
    ```
 
 ---
@@ -76,4 +82,4 @@ make
   - **`mdns.c`**: Avahi integration.
 - `include/`: Header files.
 - `support/`: Helper scripts (`setup_env.sh`, `gen_huffman.py`).
-- `build/`: Output artifacts (`zapcore`).
+- `build/`: Output artifacts (`zaplinkcore`).

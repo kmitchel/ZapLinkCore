@@ -86,32 +86,32 @@ static void* mdns_fallback_worker(void *arg) {
 
         // _http._tcp.local. (17 bytes)
         const char *svc_ptr = "\005_http\004_tcp\005local";
-        // C-Tuner._http._tcp.local. (26 bytes)
-        const char *inst_name = "\007C-Tuner\005_http\004_tcp\005local";
-        // c-tuner.local. (15 bytes)
-        const char *target_host = "\007c-tuner\005local";
+        // ZapLinkCore._http._tcp.local. (30 bytes)
+        const char *inst_name = "\013ZapLinkCore\005_http\004_tcp\005local";
+        // zaplinkcore.local. (19 bytes)
+        const char *target_host = "\013zaplinkcore\005local";
 
-        // 1. PTR: _http._tcp.local -> C-Tuner._http._tcp.local
+        // 1. PTR: _http._tcp.local -> ZapLinkCore._http._tcp.local
         memcpy(packet+p, svc_ptr, 18); p += 18;
         packet[p++] = 0x00; packet[p++] = 0x0c; // Type: PTR
         packet[p++] = 0x00; packet[p++] = 0x01; // Class: IN
         packet[p++] = 0x00; packet[p++] = 0x00; packet[p++] = 0x01; packet[p++] = 0x2c; // TTL: 300
-        packet[p++] = 0x00; packet[p++] = 26;   // RDLEN
-        memcpy(packet+p, inst_name, 26); p += 26;
+        packet[p++] = 0x00; packet[p++] = 30;   // RDLEN
+        memcpy(packet+p, inst_name, 30); p += 30;
 
-        // 2. SRV: C-Tuner._http._tcp.local -> c-tuner.local, port
-        memcpy(packet+p, inst_name, 26); p += 26;
+        // 2. SRV: ZapLinkCore._http._tcp.local -> zaplinkcore.local, port
+        memcpy(packet+p, inst_name, 30); p += 30;
         packet[p++] = 0x00; packet[p++] = 0x21; // Type: SRV
         packet[p++] = 0x00; packet[p++] = 0x01; // Class: IN
         packet[p++] = 0x00; packet[p++] = 0x00; packet[p++] = 0x00; packet[p++] = 0x78; // TTL: 120
-        packet[p++] = 0x00; packet[p++] = 0x15; // RDLEN: Pri(2)+Wei(2)+Port(2)+Target(15)
+        packet[p++] = 0x00; packet[p++] = 0x19; // RDLEN: Pri(2)+Wei(2)+Port(2)+Target(19)
         packet[p++] = 0x00; packet[p++] = 0x00; // Priority
         packet[p++] = 0x00; packet[p++] = 0x00; // Weight
         packet[p++] = (service_port >> 8) & 0xFF; packet[p++] = service_port & 0xFF;
-        memcpy(packet+p, target_host, 15); p += 15;
+        memcpy(packet+p, target_host, 19); p += 19;
 
-        // 3. TXT: C-Tuner._http._tcp.local -> "path=/playlist.m3u"
-        memcpy(packet+p, inst_name, 26); p += 26;
+        // 3. TXT: ZapLinkCore._http._tcp.local -> "path=/playlist.m3u"
+        memcpy(packet+p, inst_name, 30); p += 30;
         packet[p++] = 0x00; packet[p++] = 0x10; // Type: TXT
         packet[p++] = 0x00; packet[p++] = 0x01; // Class: IN
         packet[p++] = 0x00; packet[p++] = 0x00; packet[p++] = 0x01; packet[p++] = 0x2c; // TTL: 300
@@ -119,8 +119,8 @@ static void* mdns_fallback_worker(void *arg) {
         packet[p++] = 0x00; packet[p++] = 19;   // RDLEN
         memcpy(packet+p, txt_data, 19); p += 19;
 
-        // 4. A: c-tuner.local -> ip
-        memcpy(packet+p, target_host, 15); p += 15;
+        // 4. A: zaplinkcore.local -> ip
+        memcpy(packet+p, target_host, 19); p += 19;
         packet[p++] = 0x00; packet[p++] = 0x01; // Type: A
         packet[p++] = 0x00; packet[p++] = 0x01; // Class: IN
         packet[p++] = 0x00; packet[p++] = 0x00; packet[p++] = 0x00; packet[p++] = 0x78; // TTL: 120
@@ -178,7 +178,7 @@ int mdns_init(int port) {
     int error;
 
     service_port = port;
-    name = avahi_strdup("C Tuner");
+    name = avahi_strdup("ZapLinkCore");
     should_exit = 0;
 
     printf("[mDNS] Initializing...\n");

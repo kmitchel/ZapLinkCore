@@ -9,7 +9,7 @@ OBJ_DIR = $(BUILD_DIR)/obj
 SRCS = $(wildcard $(SRC_DIR)/*.c)
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
 
-TARGET = $(BUILD_DIR)/zapcore
+TARGET = $(BUILD_DIR)/zaplinkcore
 
 all: $(TARGET)
 
