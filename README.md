@@ -36,12 +36,17 @@ make
 # Install (creates user, directories, service)
 sudo make install
 
-# Copy your channel config
-sudo cp channels.conf /opt/zaplink/
-
 # Start the service
 sudo systemctl enable --now zaplinkcore
 ```
+
+On first run, ZapLinkCore will launch an **interactive channel scanner** that:
+1. Detects available tuners
+2. Queries your ZIP code for nearby stations
+3. Scans frequencies in parallel across all tuners
+4. Generates `channels.conf` automatically
+
+> **Already have a channels.conf?** Copy it to `/opt/zaplink/` before starting the service.
 
 ### Self-Contained Build
 Downloads and compiles dependencies locally:
