@@ -6,7 +6,7 @@ It serves a digital TV tuner (DVB/ATSC) over HTTP, providing rock-solid MPEG-TS 
 ## 🌟 The ZapLink Ecosystem
 ZapLinkCore is the backbone of a multi-platform TV experience:
 - **ZapLinkCore**: The high-performance C backend (This project).
-- **ZapLinkWeb**: A modern web-based client for browser viewing (handles transcoding).
+- **ZapLinkWeb**: A modern web-based client and transcoding provider (handles transcoding for browsers and Jellyfin).
 - **ZapLinkTV**: A native AndroidTV client for the big screen.
 
 ## 🚀 Key Features
@@ -136,7 +136,7 @@ ZapLink follows a **modular philosophy** that separates concerns:
 This design gives you **flexibility in where transcoding happens**:
 
 - **Let Jellyfin transcode**: Use ZapLinkCore's raw MPEG-TS streams. Jellyfin's Hardware Acceleration (QSV, NVENC, VAAPI) handles conversion to your client's preferred format.
-- **Use ZapLinkWeb**: For direct browser access without Jellyfin, ZapLinkWeb can handle transcoding independently.
+- **Use ZapLinkWeb**: Provides flexible transcoding for direct browser viewing or as a transcoding provider for Jellyfin.
 - **Direct playback**: VLC and other capable players can consume the raw streams directly—no transcoding needed.
 
 By keeping ZapLinkCore focused on **reliable tuner access and EPG**, you avoid duplicating transcoding logic and can leverage Jellyfin's extensive client compatibility and hardware acceleration support.
