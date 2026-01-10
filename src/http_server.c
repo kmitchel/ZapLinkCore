@@ -1,3 +1,26 @@
+/**
+ * @file http_server.c
+ * @brief Multi-threaded HTTP server for streaming and EPG endpoints
+ * 
+ * Implements a simple HTTP/1.0 server with the following endpoints:
+ * 
+ *   GET /stream/{channel}  - Raw MPEG-TS stream from tuner
+ *   GET /playlist.m3u      - M3U playlist of all channels  
+ *   GET /xmltv.xml         - EPG in XMLTV format
+ *   GET /xmltv.json        - EPG in JSON format
+ * 
+ * Architecture:
+ * - Main thread accepts connections
+ * - Each client is handled in a detached pthread
+ * - Streaming uses fork() to spawn dvbv5-zap, piping TS to socket
+ * 
+ * Flow for /stream/{channel}:
+ * 1. Acquire tuner (may preempt EPG scan)
+ * 2. Fork dvbv5-zap with channel number
+ * 3. Read TS packets from pipe, write to socket
+ * 4. On client disconnect, release tuner
+ */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,10 +35,10 @@
 #include <ctype.h>
 #include "http_server.h"
 #include "config.h"
+#include "log.h"
 #include "channels.h"
 #include "db.h"
 #include "tuner.h"
-#include "transcode.h"
 
 // Helper to find a specific header in the HTTP request buffer
 static char *find_header(const char *buffer, const char *header_name) {
@@ -72,6 +95,35 @@ void send_response(int sockfd, const char *status, const char *type, const char 
     if (body && len > 0) {
         write(sockfd, body, len);
     }
+}
+
+void send_file(int sockfd, const char *filepath, const char *content_type) {
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        send_response(sockfd, "404 Not Found", "text/plain", "File not found");
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char header[1024];
+    snprintf(header, sizeof(header), 
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %ld\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n", content_type, fsize);
+    write(sockfd, header, strlen(header));
+
+    char buffer[4096];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), f)) > 0) {
+        write(sockfd, buffer, n);
+    }
+    fclose(f);
 }
 
 void handle_m3u(int sockfd, const char *host) {
@@ -179,7 +231,7 @@ void handle_stream(int sockfd, const char *channel) {
         char adapter_id[8];
         snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
         
-        fprintf(stderr, "Executing: dvbv5-zap -c %s -P -a %s -o - \"%s\"\n", channels_conf_path, adapter_id, c->number);
+        LOG_DEBUG("HTTP", "Executing: dvbv5-zap -c %s -P -a %s -o - \"%s\"", channels_conf_path, adapter_id, c->number);
 
         execlp("dvbv5-zap", "dvbv5-zap", "-c", channels_conf_path, "-P", "-a", adapter_id, "-o", "-", c->number, NULL);
         perror("exec zap failed");
@@ -250,7 +302,7 @@ void *client_thread(void *arg) {
         return NULL;
     }
     
-    printf("Request: %s %s\n", method, path);
+    LOG_DEBUG("HTTP", "%s %s", method, path);
 
     // Strip query string
     char *query = strchr(path, '?');
@@ -269,58 +321,6 @@ void *client_thread(void *arg) {
         } else if (strncmp(path, "/stream/", 8) == 0) {
             char *chan = path + 8;
             handle_stream(sockfd, chan);
-        } else if (strncmp(path, "/transcode/", 11) == 0) {
-            // Parse /transcode/{backend}/{codec}/{channel}[/6]
-            char backend_str[32] = {0};
-            char codec_str[32] = {0};
-            char chan_str[64] = {0};
-            int surround51 = 0;
-            char *p = path + 11;
-            char *slash1 = strchr(p, '/');
-            if (slash1) {
-                strncpy(backend_str, p, slash1 - p);
-                char *slash2 = strchr(slash1 + 1, '/');
-                if (slash2) {
-                    strncpy(codec_str, slash1 + 1, slash2 - slash1 - 1);
-                    // Check for optional /6 suffix
-                    char *slash3 = strchr(slash2 + 1, '/');
-                    if (slash3) {
-                        strncpy(chan_str, slash2 + 1, slash3 - slash2 - 1);
-                        if (strcmp(slash3 + 1, "6") == 0) {
-                            surround51 = 1;
-                        }
-                    } else {
-                        strncpy(chan_str, slash2 + 1, sizeof(chan_str) - 1);
-                    }
-                }
-            }
-            TranscodeBackend backend = parse_backend(backend_str);
-            TranscodeCodec codec = parse_codec(codec_str);
-            if (backend == BACKEND_INVALID || codec == CODEC_INVALID || chan_str[0] == '\0') {
-                send_response(sockfd, "400 Bad Request", "text/plain", "Invalid transcode parameters");
-            } else {
-                handle_transcode(sockfd, backend, codec, chan_str, surround51);
-            }
-        } else if (strncmp(path, "/playlist/", 10) == 0) {
-            // Parse /playlist/{backend}/{codec}.m3u
-            char backend_str[32] = {0};
-            char codec_str[32] = {0};
-            char *p = path + 10;
-            char *slash = strchr(p, '/');
-            if (slash) {
-                strncpy(backend_str, p, slash - p);
-                char *dot = strstr(slash + 1, ".m3u");
-                if (dot) {
-                    strncpy(codec_str, slash + 1, dot - slash - 1);
-                }
-            }
-            TranscodeBackend backend = parse_backend(backend_str);
-            TranscodeCodec codec = parse_codec(codec_str);
-            if (backend == BACKEND_INVALID || codec == CODEC_INVALID) {
-                send_response(sockfd, "400 Bad Request", "text/plain", "Invalid playlist parameters");
-            } else {
-                handle_transcode_m3u(sockfd, host, backend_str, codec_str);
-            }
         } else {
             send_response(sockfd, "404 Not Found", "text/plain", "Not Found");
         }
@@ -361,7 +361,7 @@ void start_http_server(int port) {
     listen(sockfd, 5);
     clilen = sizeof(cli_addr);
 
-    printf("Server listening on port %d\n", port);
+    LOG_DEBUG("HTTP", "Listening on port %d", port);
 
     while (1) {
         newsockfd = accept(sockfd, (struct sockaddr *) &cli_addr, &clilen);

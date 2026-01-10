@@ -15,6 +15,7 @@
 #include <avahi-common/malloc.h>
 #include <avahi-common/error.h>
 #include "mdns.h"
+#include "log.h"
 
 // DNS constants
 #define MDNS_PORT 5353
@@ -67,7 +68,7 @@ static void* mdns_fallback_worker(void *arg) {
     gethostname(hostname, sizeof(hostname));
     if (get_local_ip(&ip_addr) != 0) ip_addr = inet_addr("127.0.0.1");
 
-    printf("[mDNS] Fallback responder active. Port: %d. Host: %s.local IP: %u.%u.%u.%u\n", 
+    LOG_INFO("mDNS", "Fallback responder active (Port: %d, Host: %s.local, IP: %u.%u.%u.%u)", 
            service_port, hostname, 
            (ip_addr >> 0) & 0xFF, (ip_addr >> 8) & 0xFF, (ip_addr >> 16) & 0xFF, (ip_addr >> 24) & 0xFF);
     fflush(stdout);
@@ -143,7 +144,7 @@ static void* mdns_fallback_worker(void *arg) {
 
 static void create_services(AvahiClient *c);
 static void entry_group_callback(AvahiEntryGroup *g, AvahiEntryGroupState state, AVAHI_GCC_UNUSED void *userdata) {
-    if (state == AVAHI_ENTRY_GROUP_ESTABLISHED) printf("[mDNS] Service '%s' established via Avahi.\n", name);
+    if (state == AVAHI_ENTRY_GROUP_ESTABLISHED) LOG_INFO("mDNS", "Service '%s' established via Avahi", name);
     else if (state == AVAHI_ENTRY_GROUP_COLLISION) {
         char *n = avahi_alternative_service_name(name);
         avahi_free(name);
@@ -181,14 +182,14 @@ int mdns_init(int port) {
     name = avahi_strdup("ZapLinkCore");
     should_exit = 0;
 
-    printf("[mDNS] Initializing...\n");
+    LOG_DEBUG("mDNS", "Initializing...");
     fflush(stdout);
 
     simple_poll = avahi_simple_poll_new();
     if (simple_poll) {
         client = avahi_client_new(avahi_simple_poll_get(simple_poll), 0, client_callback, NULL, &error);
         if (client) {
-            printf("[mDNS] Avahi client created successfully.\n");
+            LOG_DEBUG("mDNS", "Avahi client created successfully");
             fflush(stdout);
             use_fallback = 0;
             pthread_create(&mdns_thread, NULL, mdns_worker, NULL);
@@ -198,7 +199,7 @@ int mdns_init(int port) {
         simple_poll = NULL;
     }
 
-    printf("[mDNS] Avahi daemon not available. Using internal fallback responder.\n");
+    LOG_DEBUG("mDNS", "Avahi daemon not available, using fallback responder");
     fflush(stdout);
     use_fallback = 1;
     pthread_create(&mdns_thread, NULL, mdns_fallback_worker, NULL);

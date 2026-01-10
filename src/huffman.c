@@ -4,7 +4,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include "huffman.h"
+#include "log.h"
 
 #define HUFFMAN_MAGIC "ATHU"
 #define HUFFMAN_VERSION 1
@@ -20,12 +22,14 @@ typedef struct {
 static HuffmanNode *title_trees = NULL;
 static HuffmanNode *desc_trees = NULL;
 static int nodes_per_tree = 0;
+static int huffman_initialized = 0;
+static pthread_mutex_t huffman_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int huffman_init() {
     int fd = open("huffman.bin", O_RDONLY);
     if (fd < 0) {
         // Not a fatal error, but decoding won't work
-        fprintf(stderr, "[HUFFMAN] Warning: huffman.bin not found. Huffman decoding disabled.\n");
+        LOG_DEBUG("HUFFMAN", "huffman.bin not found, Huffman decoding disabled");
         return 0;
     }
 
@@ -39,7 +43,7 @@ int huffman_init() {
     }
 
     if (memcmp(header.magic, HUFFMAN_MAGIC, 4) != 0 || header.version != HUFFMAN_VERSION) {
-        fprintf(stderr, "[HUFFMAN] Error: Invalid huffman.bin format or version.\n");
+        LOG_WARN("HUFFMAN", "Invalid huffman.bin format or version");
         close(fd);
         return 0;
     }
@@ -63,7 +67,7 @@ int huffman_init() {
     read(fd, desc_trees, tree_size);
 
     close(fd);
-    printf("[HUFFMAN] Tables loaded successfully (%d nodes per tree).\n", nodes_per_tree);
+    LOG_DEBUG("HUFFMAN", "Tables loaded (%d nodes per tree)", nodes_per_tree);
     return 1;
 }
 
@@ -79,6 +83,14 @@ static int get_bit(const uint8_t *src, int bit_pos) {
 }
 
 int huffman_decode(int compr_type, const uint8_t *src, int src_len, char *dest, int dest_len) {
+    // Lazy initialization: load tables on first decode attempt
+    pthread_mutex_lock(&huffman_mutex);
+    if (!huffman_initialized) {
+        huffman_init();
+        huffman_initialized = 1;
+    }
+    pthread_mutex_unlock(&huffman_mutex);
+
     HuffmanNode *base_trees = (compr_type == 1) ? title_trees : desc_trees;
     if (!base_trees) return 0;
 

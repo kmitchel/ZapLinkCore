@@ -1,3 +1,19 @@
+/**
+ * @file db.c
+ * @brief SQLite database implementation for EPG storage
+ * 
+ * Stores and retrieves Electronic Program Guide data. The programs
+ * table uses a composite primary key (frequency, channel, start_time)
+ * to uniquely identify each program entry.
+ * 
+ * Output formats:
+ * - XMLTV: Standard format for EPG interchange, compatible with Jellyfin/Plex
+ * - JSON: Lightweight format for web clients like ZapLinkWeb
+ * 
+ * The database is stored in the working directory as epg.db.
+ * Expired entries (ended > 24 hours ago) are periodically cleaned up.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +23,7 @@
 #include "config.h"
 #include "channels.h"
 
+/* SQLite database connection handle */
 sqlite3 *db = NULL;
 
 int db_init() {
@@ -88,8 +105,8 @@ char *db_get_xmltv_programs() {
     if (!db) return NULL;
 
     sqlite3_stmt *stmt;
-    // Order by Major.Minor numerical sort
-    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id FROM programs "
+    // Order by Major.Minor numerical sort, include frequency for unique ID generation
+    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id, frequency FROM programs "
                       "ORDER BY CAST(SUBSTR(channel_service_id, 1, INSTR(channel_service_id, '.') - 1) AS INTEGER), "
                       "CAST(SUBSTR(channel_service_id, INSTR(channel_service_id, '.') + 1) AS INTEGER), start_time;";
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -101,12 +118,13 @@ char *db_get_xmltv_programs() {
     if (!xml) return NULL;
     xml[0] = '\0';
 
-    append_str(&xml, &size, &cap, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv>\n");
+    append_str(&xml, &size, &cap, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE tv SYSTEM \"xmltv.dtd\">\n<tv generator-info-name=\"ZapLinkCore\">\n");
 
-    // Channel list
+    // Channel list - use unique IDs
     for (int i = 0; i < channel_count; i++) {
+        const char *unique_id = get_unique_channel_id(&channels[i]);
         char buf[256];
-        snprintf(buf, sizeof(buf), "  <channel id=\"%s\">\n    <display-name>", channels[i].number);
+        snprintf(buf, sizeof(buf), "  <channel id=\"%s\">\n    <display-name>", unique_id);
         append_str(&xml, &size, &cap, buf);
         xml_escape_append(&xml, &size, &cap, channels[i].name);
         append_str(&xml, &size, &cap, "</display-name>\n  </channel>\n");
@@ -117,7 +135,22 @@ char *db_get_xmltv_programs() {
         const char *desc = (const char *)sqlite3_column_text(stmt, 1);
         long long start = sqlite3_column_int64(stmt, 2);
         long long end = sqlite3_column_int64(stmt, 3);
-        const char *svc_id = (const char *)sqlite3_column_text(stmt, 4); 
+        const char *svc_id = (const char *)sqlite3_column_text(stmt, 4);
+        const char *freq = (const char *)sqlite3_column_text(stmt, 5);
+
+        // Look up channel to get unique ID
+        Channel *ch = NULL;
+        if (freq && svc_id) {
+            // Try to find by frequency, fall back to basic lookup
+            for (int i = 0; i < channel_count; i++) {
+                if (strcmp(channels[i].frequency, freq) == 0 && 
+                    strcmp(channels[i].number, svc_id) == 0) {
+                    ch = &channels[i];
+                    break;
+                }
+            }
+        }
+        const char *channel_id = ch ? get_unique_channel_id(ch) : (svc_id ? svc_id : "");
 
         // Format dates (YYYYMMDDHHMMSS +0000)
         time_t start_s = start / 1000;
@@ -132,7 +165,7 @@ char *db_get_xmltv_programs() {
 
         char buf[512];
         snprintf(buf, sizeof(buf), "  <programme start=\"%s\" stop=\"%s\" channel=\"%s\">\n", 
-                 start_str, end_str, svc_id ? svc_id : "");
+                 start_str, end_str, channel_id);
         append_str(&xml, &size, &cap, buf);
 
         append_str(&xml, &size, &cap, "    <title>");

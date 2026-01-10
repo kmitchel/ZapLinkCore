@@ -1,3 +1,27 @@
+/**
+ * @file epg.c
+ * @brief Electronic Program Guide collection from ATSC broadcasts
+ * 
+ * Collects EPG data by parsing ATSC PSIP (Program and System Information Protocol)
+ * tables from the transport stream. Scans each frequency (mux) every 15 minutes.
+ * 
+ * ATSC Tables Parsed:
+ * - MGT (0xC7): Master Guide Table - lists PIDs for EIT tables
+ * - VCT (0xC8/0xC9): Virtual Channel Table - maps source_id to channel number
+ * - EIT (0xCB): Event Information Table - program titles and times
+ * - ETT (0xCC): Extended Text Table - program descriptions
+ * 
+ * Architecture:
+ * - Orchestrator thread: Enqueues mux scan jobs, manages 15-min cycle
+ * - Worker threads: One per tuner, dequeue and execute scan jobs
+ * - Preemption: Workers can be interrupted by stream requests
+ * 
+ * Channel Mapping:
+ * Uses channels.conf SERVICE_ID for accurate frequency+service_id → channel
+ * mapping. This prevents cross-frequency source_id collisions where the same
+ * source_id appears on different frequencies with different meanings.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,49 +33,65 @@
 #include <ctype.h> 
 #include "epg.h"
 #include "config.h"
+#include "log.h"
 #include "tuner.h"
 #include "channels.h"
 #include "db.h"
 #include "huffman.h"
 
-// -----------------------------------------------------------------------------
-// Data Structures
-// -----------------------------------------------------------------------------
+/* ============================================================================
+ * Data Structures
+ * ============================================================================ */
 
-#define TS_PACKET_SIZE 188
-#define MAX_EIT_PIDS 8
+#define TS_PACKET_SIZE 188   /* MPEG-TS packet size */
+#define MAX_EIT_PIDS 8       /* Max EIT PIDs to track per mux */
 
+/**
+ * Buffer for accumulating PSI/SI section data across TS packets
+ * Sections can span multiple packets; this tracks reassembly state
+ */
 typedef struct {
-    unsigned char buffer[4096];
-    int len;
-    int expected_len;
-    int active;
+    unsigned char buffer[4096];  /* Section data accumulator */
+    int len;                     /* Current accumulated length */
+    int expected_len;            /* Total expected section length */
+    int active;                  /* Whether we're mid-section */
 } SectionBuffer;
 
-// Per-scan context to allow concurrent scanning
+/**
+ * Per-scan context - allows concurrent scanning on multiple tuners
+ * Each worker thread gets its own context to avoid shared state
+ */
 typedef struct {
-    SectionBuffer pid_buffers[8192];
-    int eit_pids[MAX_EIT_PIDS];
-    int eit_pid_count;
-    const char *freq;
+    SectionBuffer pid_buffers[8192];  /* Buffer per possible PID */
+    int eit_pids[MAX_EIT_PIDS];       /* Discovered EIT PIDs from MGT */
+    int eit_pid_count;                /* Number of EIT PIDs found */
+    const char *freq;                 /* Current frequency being scanned */
 } ScanContext;
 
+/**
+ * Source ID to channel number mapping entry
+ * Built from VCT during scan, used by EIT/ETT parsers
+ */
 typedef struct {
-    char key[64];
-    char val[16];
+    char key[64];   /* Format: "frequency_sourceid" */
+    char val[16];   /* Virtual channel number (e.g., "15.1") */
 } SourceMap;
 
+/* VCT source_id → channel mapping (fallback, prefer channels.conf) */
 static SourceMap source_map[256];
 static int source_map_count = 0;
 static pthread_mutex_t source_map_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Job Queue for Muxes
+/**
+ * Mux scan job - represents one frequency to scan
+ */
 typedef struct {
-    char freq[32];
-    char name[64];
-    char number[32];
+    char freq[32];     /* Frequency in Hz */
+    char name[64];     /* Representative channel name */
+    char number[32];   /* Representative channel number (for dvbv5-zap) */
 } MuxJob;
 
+/* Job queue for mux scans */
 #define MAX_MUX_QUEUE 256
 static MuxJob mux_queue[MAX_MUX_QUEUE];
 static int mux_queue_head = 0;
@@ -60,6 +100,7 @@ static int mux_queue_count = 0;
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
+/* EPG thread state */
 int epg_running = 0;
 int epg_skip_first = 0;
 static int epg_completed_cycles = 0;
@@ -212,7 +253,7 @@ void *epg_orchestrator(void *arg) {
     // If not skipping, we scan immediately.
     
     if (epg_skip_first) {
-        printf("[EPG] Database has data. Skipping initial scan cycle.\n");
+        LOG_DEBUG("EPG", "Database has data, skipping initial scan cycle");
         fflush(stdout);
         // Sleep 15 mins (broken into chunks to allow exit)
         for(int k=0; k<15*60; k++) {
@@ -222,7 +263,7 @@ void *epg_orchestrator(void *arg) {
     }
 
     while (epg_running) {
-        printf("[EPG] Starting scan cycle...\n");
+        LOG_INFO("EPG", "Starting scan cycle...");
         fflush(stdout);
         db_cleanup_expired();
 
@@ -257,7 +298,7 @@ void *epg_orchestrator(void *arg) {
             if (!epg_running) break;
         }
 
-        printf("[EPG] Scan cycle complete.\n");
+        LOG_INFO("EPG", "Scan cycle complete");
         fflush(stdout);
 
         // Notify that a cycle has completed
@@ -266,7 +307,7 @@ void *epg_orchestrator(void *arg) {
         pthread_cond_broadcast(&cycle_cond);
         pthread_mutex_unlock(&cycle_mutex);
 
-        printf("[EPG] Sleeping 15 minutes...\n");
+        LOG_DEBUG("EPG", "Sleeping 15 minutes...");
         fflush(stdout);
         for(int k=0; k<15*60; k++) {
             if (!epg_running) break;
@@ -277,14 +318,14 @@ void *epg_orchestrator(void *arg) {
 }
 
 void wait_for_first_epg_scan() {
-    printf("[EPG] Waiting for first scan cycle to complete...\n");
+    LOG_INFO("EPG", "Waiting for first scan cycle to complete...");
     fflush(stdout);
     pthread_mutex_lock(&cycle_mutex);
     while (epg_completed_cycles == 0 && epg_running) {
         pthread_cond_wait(&cycle_cond, &cycle_mutex);
     }
     pthread_mutex_unlock(&cycle_mutex);
-    printf("[EPG] First scan cycle detected. Proceeding.\n");
+    LOG_DEBUG("EPG", "First scan cycle detected, proceeding");
     fflush(stdout);
 }
 
@@ -350,7 +391,7 @@ static void atsc_mss_to_string(const unsigned char *buf, int len, char *dest, si
             } else if (compr == 0x01 || compr == 0x02) {
                 // Huffman (A/65 Annex C)
                 if (!huffman_decode(compr, buf + pos, n_bytes, dest, dest_len)) {
-                    printf("[EPG] Failed to decode Huffman segment type 0x%02X\n", compr);
+                    LOG_WARN("EPG", "Failed to decode Huffman segment type 0x%02X", compr);
                     const char *msg = "[Compressed]";
                     if (dest_len - strlen(dest) > strlen(msg) + 1) strcat(dest, msg);
                 }
@@ -528,8 +569,17 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
     int num_events = section[9];
     int offset = 10;
 
-    const char *chan_num = get_source_map(ctx->freq, source_id);
-    if (!chan_num) return;
+    // Look up channel using channels.conf SERVICE_ID for accurate mapping
+    // This avoids cross-frequency source_id collisions
+    Channel *ch = find_channel_by_freq_sid(ctx->freq, source_id);
+    if (!ch) {
+        // Fall back to VCT map only for channels not in channels.conf
+        const char *vct_chan = get_source_map(ctx->freq, source_id);
+        if (!vct_chan) return;
+        ch = find_channel_by_number(vct_chan);
+        if (!ch) return;
+    }
+    const char *chan_num = ch->number;
 
     for (int i = 0; i < num_events; i++) {
         if (offset + 10 > len) break;
@@ -577,10 +627,17 @@ void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len) {
     unsigned int etm_id = (section[9] << 24) | (section[10] << 16) | (section[11] << 8) | section[12];
     int event_id = (etm_id >> 2) & 0x3FFF;
     
-    const char *chan_num = get_source_map(ctx->freq, source_id_from_header);
-    if (!chan_num) {
-        const char *first = get_first_channel_on_freq(ctx->freq);
-        if (first) chan_num = first; else return;
+    // Use channels.conf SERVICE_ID for accurate mapping
+    Channel *ch = find_channel_by_freq_sid(ctx->freq, source_id_from_header);
+    const char *chan_num = NULL;
+    if (ch) {
+        chan_num = ch->number;
+    } else {
+        chan_num = get_source_map(ctx->freq, source_id_from_header);
+        if (!chan_num) {
+            const char *first = get_first_channel_on_freq(ctx->freq);
+            if (first) chan_num = first; else return;
+        }
     }
     
     int section_length = ((section[1] & 0x0F) << 8) | section[2];
@@ -600,7 +657,7 @@ void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char
     if (pipe(pipefd) == -1) return;
     
     // Log with both for clarity, but zap with number
-    printf("[EPG] Scanning Mux %s (%s, #%s) on Tuner %d\n", ctx->freq, channel_name, channel_number, t->id);
+    LOG_DEBUG("EPG", "Scanning Mux %s (%s, #%s) on Tuner %d", ctx->freq, channel_name, channel_number, t->id);
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -636,7 +693,7 @@ void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char
         t->zap_pid = 0;
         
         if (WIFSIGNALED(status)) {
-            printf("[EPG] Scan of %s interrupted (likely preempted)\n", ctx->freq);
+            LOG_DEBUG("EPG", "Scan of %s interrupted (likely preempted)", ctx->freq);
             fflush(stdout);
             // Re-enqueue
             enqueue_mux(ctx->freq, channel_name, channel_number);

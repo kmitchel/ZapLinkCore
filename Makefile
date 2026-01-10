@@ -48,33 +48,37 @@ clean:
 
 local: $(TARGET)
 
-# Installation
-PREFIX ?= /usr/local
-BINDIR = $(PREFIX)/bin
-CONFDIR = /etc/zaplink
+# Installation paths - all files live under /opt/zaplink
+INSTALL_DIR = /opt/zaplink
+BINDIR = $(INSTALL_DIR)
+CONFDIR = $(INSTALL_DIR)
 SERVICEFILE = zaplinkcore.service
 
 install: $(TARGET)
+	@echo "Creating install directory..."
+	@mkdir -p $(INSTALL_DIR)
 	@echo "Creating zaplink user..."
-	@id -u zaplink &>/dev/null || useradd -r -s /usr/sbin/nologin -d $(CONFDIR) zaplink
-	@echo "Creating config directory..."
-	@mkdir -p $(CONFDIR)
-	@chown zaplink:zaplink $(CONFDIR)
+	@id -u zaplink &>/dev/null || useradd -r -s /usr/sbin/nologin -d $(INSTALL_DIR) zaplink
 	@echo "Installing binary..."
-	@install -m 755 $(TARGET) $(BINDIR)/zaplinkcore
+	@install -m 755 -o zaplink -g zaplink $(TARGET) $(BINDIR)/zaplinkcore
 	@echo "Installing support files..."
-	@test -f huffman.bin && install -m 644 huffman.bin $(CONFDIR)/ || true
+	@test -f huffman.bin && install -m 644 -o zaplink -g zaplink huffman.bin $(CONFDIR)/ || true
+	@echo "Setting directory ownership..."
+	@chown zaplink:zaplink $(INSTALL_DIR)
 	@echo "Installing systemd service..."
 	@install -m 644 $(SERVICEFILE) /etc/systemd/system/
 	@systemctl daemon-reload
 	@echo ""
 	@echo "Installation complete!"
-	@echo "  Config directory: $(CONFDIR)"
+	@echo "  Install directory: $(INSTALL_DIR)"
 	@echo "  Binary: $(BINDIR)/zaplinkcore"
 	@echo ""
 	@echo "Next steps:"
-	@echo "  1. Copy channels.conf to $(CONFDIR)/"
-	@echo "  2. Run: sudo systemctl enable --now zaplinkcore"
+	@echo "  1. Run: sudo systemctl enable --now zaplinkcore"
+	@echo "  2. On first run, the built-in channel scanner will guide you"
+	@echo "     through tuner selection and frequency scanning."
+	@echo ""
+	@echo "Or, manually copy an existing channels.conf to $(CONFDIR)/"
 
 uninstall:
 	@echo "Stopping service..."

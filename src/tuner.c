@@ -1,3 +1,19 @@
+/**
+ * @file tuner.c
+ * @brief DVB tuner resource management implementation
+ * 
+ * Manages exclusive access to DVB tuner hardware. Key features:
+ * 
+ * - Discovery: Scans /dev/dvb/adapter* for available tuners
+ * - Acquisition: Thread-safe tuner locking with round-robin selection
+ * - Preemption: Stream requests can preempt background EPG scans
+ * - Cleanup: Graceful process termination (SIGTERM then SIGKILL)
+ * 
+ * Thread safety: All acquisition/release operations are protected
+ * by a mutex to prevent race conditions between stream handlers
+ * and EPG worker threads.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,12 +25,14 @@
 #include <errno.h>
 #include "tuner.h"
 #include "config.h"
+#include "log.h"
 
+/* Global tuner state */
 Tuner tuners[MAX_TUNERS];
 int tuner_count = 0;
-int last_tuner_index = -1;
+int last_tuner_index = -1;  /* For round-robin selection */
 
-// Mutex to protect tuner acquisition/release
+/* Mutex protecting all tuner state modifications */
 static pthread_mutex_t tuner_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void discover_tuners() {
@@ -22,7 +40,7 @@ void discover_tuners() {
     struct dirent *dir;
     d = opendir("/dev/dvb");
     if (!d) {
-        printf("Warning: /dev/dvb not found.\n");
+        LOG_WARN("TUNER", "/dev/dvb not found");
         return;
     }
 
@@ -42,7 +60,6 @@ void discover_tuners() {
                          "/dev/dvb/%s", dir->d_name);
                 tuners[tuner_count].in_use = 0;
                 tuners[tuner_count].zap_pid = 0;
-                tuners[tuner_count].ffmpeg_pid = 0;
                 tuners[tuner_count].user_type = USER_NONE;
                 tuner_count++;
             }
@@ -51,7 +68,7 @@ void discover_tuners() {
     closedir(d);
     
     // Sort logic could be added here
-    printf("Discovered %d tuners.\n", tuner_count);
+    LOG_INFO("TUNER", "Discovered %d tuners", tuner_count);
 }
 
 // Internal helper to terminate a process gracefully
@@ -103,17 +120,13 @@ Tuner *acquire_tuner(TunerUser purpose) {
         for (int i = 0; i < tuner_count; i++) {
             int idx = (last_tuner_index + 1 + i) % tuner_count;
             if (tuners[idx].user_type == USER_EPG) {
-                printf("[TUNER] Preempting EPG scan on Tuner %d for STREAM\n", tuners[idx].id);
+                LOG_DEBUG("TUNER", "Preempting EPG scan on Tuner %d for STREAM", tuners[idx].id);
                 
                 // Kill the EPG scan process
                 // Note: terminate_process reaps the zombie
                 if (tuners[idx].zap_pid > 0) {
                     terminate_process(tuners[idx].zap_pid);
                     tuners[idx].zap_pid = 0;
-                }
-                if (tuners[idx].ffmpeg_pid > 0) {
-                    terminate_process(tuners[idx].ffmpeg_pid);
-                    tuners[idx].ffmpeg_pid = 0;
                 }
                 
                 // Keep in_use=1 but change type
@@ -139,10 +152,6 @@ void release_tuner(Tuner *t) {
     if (t->zap_pid > 0) {
         terminate_process(t->zap_pid);
         t->zap_pid = 0;
-    }
-    if (t->ffmpeg_pid > 0) {
-        terminate_process(t->ffmpeg_pid);
-        t->ffmpeg_pid = 0;
     }
     
     t->in_use = 0;

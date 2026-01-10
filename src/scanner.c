@@ -43,23 +43,29 @@ static int get_adapter_count() {
 }
 
 static void fetch_and_process(const char *zip, const char *scan_file) {
-    // ... (This function remains effectively the same as previous step for RabbitEars logic) ...
-    // Re-implementing specifically for completeness in this file rewrite.
     char url[256];
     snprintf(url, sizeof(url), "%s%s", RABBIT_EARS_URL, zip);
     
     char tmp_html[] = "/tmp/zapcore_scan.html";
-    char cmd[512];
     
     printf("[SCANNER] Querying RabbitEars for %s...\n", zip);
-    snprintf(cmd, sizeof(cmd), "curl -s -o %s \"%s\"", tmp_html, url);
-    system(cmd);
+    
+    /* Use fork/exec instead of system() to avoid command injection risk */
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child process */
+        execlp("curl", "curl", "-s", "-o", tmp_html, url, NULL);
+        _exit(1);
+    } else if (pid > 0) {
+        /* Parent: wait for curl to complete */
+        int status;
+        waitpid(pid, &status, 0);
+    }
     
     FILE *f = fopen(tmp_html, "r");
     if (!f) {
         printf("[SCANNER] Failed to fetch data. Falling back to full scan.\n");
-        // Create full list
-        f = NULL; // Flag to create full scan later
+        f = NULL;
     }
 
     int found_channels[100] = {0};

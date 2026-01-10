@@ -6,8 +6,8 @@ After=network.target
 Type=simple
 User=zaplink
 Group=zaplink
-WorkingDirectory=/etc/zaplink
-ExecStart=/usr/local/bin/zaplinkcore
+WorkingDirectory=/opt/zaplink
+ExecStart=/opt/zaplink/zaplinkcore
 Restart=on-failure
 RestartSec=5
 
@@ -18,7 +18,7 @@ SupplementaryGroups=video
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/etc/zaplink
+ReadWritePaths=/opt/zaplink
 
 [Install]
 WantedBy=multi-user.target
